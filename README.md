@@ -184,9 +184,6 @@ website links and the links in `spotcheck_links.csv` (optional).
 - **Verdicts:** MATCH, DIFFERENT, APP MISSED, CAN'T TELL, BOTH EMPTY.
 - **Output:** writes `spotcheck_<date>.csv`.
 
-The selling price is no longer compared here. The earlier selling-price
-comparison is in this repository's first commit (`engine/spotcheck.py`).
-
 ### Weekly health check (`engine/weekly.py`)
 
 This is meant to run every Monday at 11 am from Windows Task Scheduler. For
@@ -219,73 +216,3 @@ It keeps its results in `checks/` and never writes to the catalogue.
 | `engine/weekly.py` | The weekly health check |
 | `engine/validate.py` | 329 offline tests |
 | `data/brand_catalogue.xlsx` | The saved brands (one sheet per brand): barcodes, Zoddle prices, MRPs, each marketplace's link |
-
-## Updates
-
-**29 Sep 2026**
-
-- **This repository** (private) holds the engine, `requirements.txt`,
-  this README and the brand catalogue (`data/`).
-
-**28 Sep 2026**
-
-- **The spot-check and the weekly check compare the MRP, not the selling
-  price.** Runs still report selling prices. Along the way:
-  - The app now reads the MRP for Flipkart (from its pricing record), for
-    Myntra per size (sizes can differ, e.g. 1999 and 2199), and for Biba
-    and Panash (from their own page markup).
-  - The page script now picks up an MRP labelled "MRP", and Flipkart's
-    struck MRP, which it prints with no rupee sign.
-  - **Measured:** 72 of 77 website links MATCH with none wrong, and every
-    link that read in a weekly trial matched, on all five channels.
-- **Weekly health check added:** `engine/weekly.py`, with a mandatory
-  spot-check on every channel. It reports only when something fails.
-- **Spot-check added** (`engine/spotcheck.py`). Stale schema.org tags had
-  been the biggest source of wrong website prices (Fabindia, Jaypore,
-  Pantaloons).
-- **Headless-browser last resort** (`engine/browser.py`). It is paced,
-  follows robots.txt, reads rupees only, and refuses rather than guesses.
-- **New readers:**
-  - Hopscotch, now per size again;
-  - Nushop, Wix, the WooCommerce Store API, Salesforce size buttons and
-    Fynd (Mothercare).
-- **Prices not in rupees are refused.** Little Muffet and Aachho price in
-  USD.
-- **A page that says "Page Not Found"** but is sent as a normal page is
-  read as delisted.
-- **Amazon:**
-  - Amazon is paced at one page every 3 s.
-  - A run reads its sites side by side, so the slower pace does not make
-    it longer.
-  - Amazon's "slow down" page is waited on briefly; after that, Refetch.
-
-**26 Sep 2026**
-
-- **A stress test fixed 17 bugs.** The biggest: Amazon and Flipkart give
-  every size its own page, and one size's price had been shown on every
-  size.
-- **Every cell says one of four things:** a price, out of stock, no price
-  or not fetched.
-- **The own website shows sold-out sizes,** read from Shopify's `.js`.
-- **Pop-up for skipped links,** with Refetch and Ignore.
-- **A size the page does not sell is "no price",** with the covering-size
-  rule for different age cuts.
-
-**24 Sep 2026**
-
-- **The page was cut down to** the inputs and the results: List and
-  Thumbnails, every price a link, Lowest price and Lowest source.
-- **Downloads** became the input file with prices filled in, `-` for none,
-  and an Excel copy.
-- **Photograph matching, name matching and the old intake format were
-  removed.** The file's link is the listing.
-- **Several design codes** can be listed, separated by commas.
-
-**23 Sep 2026**
-
-- **Split out of the ZOCS Price Watch project** to do polling only.
-- **A new input file** with one link column per marketplace, and Amazon
-  and Flipkart in their own columns.
-- **FirstCry priced** from its product page.
-- **The brand catalogue:** uploads are saved per brand and can be fetched
-  again with no file.
