@@ -218,8 +218,14 @@ It keeps its results in `checks/` and never writes to the catalogue.
 | `engine/spotcheck.py` | The MRP spot-check |
 | `engine/weekly.py` | The weekly health check |
 | `engine/validate.py` | 329 offline tests |
+| `data/brand_catalogue.xlsx` | The saved brands (one sheet per brand): barcodes, Zoddle prices, MRPs, each marketplace's link |
 
 ## Updates
+
+**29 Sep 2026**
+
+- **This repository** (private) holds the engine, `requirements.txt`,
+  this README and the brand catalogue (`data/`).
 
 **28 Sep 2026**
 
