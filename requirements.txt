@@ -1,0 +1,12 @@
+#   pip install -r requirements.txt
+#
+# Serving is standard library only. These are what the app itself needs.
+# Fetching product pages (engine/sites.py).
+requests>=2.31
+# Reading .xlsx input files and the brand catalogue (engine/linkfile.py,
+# engine/catalogue.py).
+openpyxl>=3.1
+# The last-resort reader for brand sites that build their price in the
+# browser (engine/browser.py). Optional: without it those pages say so.
+#   then once: python -m playwright install chromium
+playwright>=1.40
