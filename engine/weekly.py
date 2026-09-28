@@ -18,8 +18,9 @@ is a HEALTH check, not a product audit:
     page", "not in rupees", "not allowed". Such links are tried once more
     after RETRY_AFTER_SECONDS (a site that did not answer, Amazon's check
     page), and only then counted.
-  * EVERY link that reads, on every channel, is spot-checked: its price
-    is compared with what a shopper sees (spotcheck.shopper_view) -- own
+  * EVERY link that reads, on every channel, is spot-checked: its MRP --
+    not its selling price (Abhisekh, 28 Sep 2026) -- is compared with the
+    MRP a shopper sees (spotcheck.shopper_view, spotcheck.verdict) -- own
     websites and Amazon, Flipkart, FirstCry in a headless browser (the
     marketplace's own price box), Myntra from its page summary (it refuses
     the headless browser). A channel that reads but could not be
@@ -83,8 +84,8 @@ def group_issues(brand, chan, results):
             out.append(("Not readable", brand, name, why, url))
         elif shopper and shopper[0] in ("DIFFERENT", "APP MISSED"):
             out.append(("Read, but not what shoppers see", brand, name,
-                        "the app reads %s; the page shows %s" % (
-                            " ".join("%g" % x for x in shopper[1]) or "no price",
+                        "the app reads MRP %s; the page shows MRP %s" % (
+                            " ".join("%g" % x for x in shopper[1]) or "none",
                             " ".join("%g" % x for x in shopper[2])), url))
     read = [(u, s) for u, v, _w, s in results if v == "reads"]
     if read and not out and not any(s and s[0] == "MATCH" for _u, s in read):

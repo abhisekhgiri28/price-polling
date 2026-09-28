@@ -2525,6 +2525,10 @@ def js_sites(k):
          got["offers"])
     k.ok("page script: 'MRP Rs 1,279 Rs 799' is the price 799 (bownbee.com)",
          got["bownbee"]["sell"] == [799], got["bownbee"])
+    k.ok("page script: the MRP shown -- labelled 'MRP' or struck through",
+         got["bownbee"].get("mrp") == [1279] and got["fab"].get("mrp") == [2199]
+         and got["tss"].get("mrp") == [699] and got["offers"].get("mrp") == [1799],
+         [got[n].get("mrp") for n in ("bownbee", "fab", "tss", "offers")])
     k.ok("page script: with no <h1>, the name the page's title gives is the "
          "heading (nusyl.com)", got["no_h1"]["sell"] == [749] and
          "Anime" in got["no_h1"]["h1"], got["no_h1"])
@@ -2584,6 +2588,56 @@ def weekly_check(k):
                                   'VASTRAMAY at Rs. 1,984. Style ID: 25646028" />')
     k.ok("spot-check: Myntra's own page summary gives the price shoppers are told",
          my["sell"] == [1984.0], my)
+    my = spotcheck.myntra_summary(
+        '<meta name="description" content="... from Aj DEZInES at Rs. 829. Style ID: 1" />'
+        '"sizeSellerData":[{"mrp":2599,"sellerPartnerId":1}]'
+        '"sizeSellerData":[{"mrp":2599,"sellerPartnerId":1}]')
+    k.ok("spot-check: Myntra's MRP from each size's seller, a second place",
+         my["struck"] == [2599.0] and spotcheck.page_mrps(my) == [2599.0], my)
+
+    # -- the spot-check compares the MRP (Abhisekh, 28 Sep 2026)
+    def V(price, compare_at=None):
+        return sites.Variant(frozenset(), price, compare_at, None, None)
+
+    def LM(variants, listed_mrp=None):
+        return sites._listing("https://x.example/p", "x.example", "storefront",
+                              ok=True, variants=variants, listed_mrp=listed_mrp)
+    k.ok("spot-check MRP: each size's own MRP; the page's one MRP; else the price",
+         spotcheck.app_mrps(LM([V(839.0, 3499.0), V(1609.0, 3999.0)])) == [3499.0, 3999.0]
+         and spotcheck.app_mrps(LM([V(829.0), V(829.0)], 2599.0)) == [2599.0]
+         and spotcheck.app_mrps(LM([V(999.0)])) == [999.0])
+    k.ok("spot-check MRP: struck or labelled MRP; no MRP shown = the price shown",
+         spotcheck.page_mrps({"sell": [839], "struck": [3499]}) == [3499.0]
+         and spotcheck.page_mrps({"sell": [799], "struck": [], "mrp": [1279]}) == [1279.0]
+         and spotcheck.page_mrps({"sell": [999], "struck": []}) == [999.0])
+    k.ok("spot-check MRP: same MRP, different selling price is a MATCH",
+         spotcheck.verdict(LM([V(799.0, 1279.0)]),
+                           {"sell": [899], "struck": [1279]})[0] == "MATCH")
+    k.ok("spot-check MRP: a page MRP the app did not read is DIFFERENT",
+         spotcheck.verdict(LM([V(799.0, 1279.0)]),
+                           {"sell": [799], "struck": [1499]})[0] == "DIFFERENT")
+    k.ok("spot-check MRP: the app says discounted, the page shows no MRP -> DIFFERENT",
+         spotcheck.verdict(LM([V(799.0, 1279.0)]), {"sell": [799]})[0] == "DIFFERENT")
+    k.ok("spot-check MRP: a price range is not compared (the MRP shows per size)",
+         spotcheck.page_mrps({"sell": [549, 599], "struck": [1199]}) == []
+         and spotcheck.verdict(LM([V(549.0, 899.0)]),
+                               {"sell": [549, 599], "struck": [1199]})[0] == "CAN'T TELL")
+    biba = ('<del><span class="strike-through list">\n  <span class="value" '
+            'content="1999.00">')
+    magento = ('"prices":{"baseOldPrice":{"amount":4883,"adjustments":[]},'
+               '"oldPrice":{"amount":4883,"adjustments":[]}}')
+    k.ok("page MRP: Salesforce's struck list price, Magento's old price",
+         sites._page_mrp(biba, 1199.4) == 1999.0
+         and sites._page_mrp(magento, 2930.0) == 4883.0)
+    k.ok("page MRP: two different MRPs, or one not above the price, is none",
+         sites._page_mrp(magento + '"oldPrice":{"amount":999', 2930.0) is None
+         and sites._page_mrp(magento, 4883.0) is None)
+    fk = ('"ppd":{"fsp":1344,"finalPrice":1424,"mrp":2999,"nepPrice":1276}'
+          '"ppd":{"fsp":499,"finalPrice":520,"mrp":1299}')
+    k.ok("Flipkart MRP: from the pricing record whose price is this listing's",
+         sites._flipkart_mrp(fk, 1344.0) == 2999.0
+         and sites._flipkart_mrp(fk, 700.0) is None
+         and sites._flipkart_mrp(fk + '"ppd":{"fsp":1344,"mrp":3999}', 1344.0) is None)
     k.ok("spot-check: each marketplace gets its own price box; a website none",
          browser.market_probe("https://www.amazon.in/dp/B0X") is browser.MARKET_JS["amazon"]
          and browser.market_probe("https://www.flipkart.com/x/p/itm1") is browser.MARKET_JS["flipkart"]
@@ -2603,8 +2657,11 @@ def weekly_check(k):
                      'class="rupee"></label><span class="prod-price" data-price='
                      '"1566.68">1566<sup class="supertag">68</sup></span> <span>'
                      '<span>MRP:</span><del>2999</del></span></p>'),
-        "flipkart": ('<h1>Lehenga</h1><div style="font-size:27px">&#8377;1,344</div>'
+        "flipkart": ('<h1>Lehenga</h1><div><div style="font-size:27px">&#8377;1,344</div>'
+                     '<div style="font-size:27px;text-decoration:line-through">'
+                     '2,999</div></div>'
                      '<div style="font-size:20px">Buy at &#8377;1,276</div>'
+                     '<div style="font-size:14px">Discount on MRP -&#8377;1,655</div>'
                      '<div style="font-size:16px">&#8377;68 off</div>'
                      '<div style="font-size:11px">&#8377;892</div>')}
     got = {}
@@ -2628,6 +2685,8 @@ def weekly_check(k):
          got["firstcry"])
     k.ok("Flipkart: the largest price on screen, never 'Buy at' or 'off'",
          got["flipkart"]["sell"] == [1344], got["flipkart"])
+    k.ok("Flipkart: the struck-through MRP beside that price",
+         got["flipkart"]["struck"] == [2999], got["flipkart"])
 
 
 def main(argv=None):

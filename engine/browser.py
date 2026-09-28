@@ -131,6 +131,23 @@ SHOWN_JS = r"""
     }
     return got;
   };
+  // Amounts the page labels as the MRP ("MRP Rs 1,279", "M.R.P.: Rs 999",
+  // "MRP (incl. of all taxes) Rs 999") -- never a saving ("Discount on
+  // MRP -Rs 1,655", "Rs 300 off MRP"). For the weekly MRP spot-check.
+  const MRP_WORD = /\bM\.?\s?R\.?\s?P\b\.?\s*(?:\([^)]{0,30}\))?\s*:?\s*$/i;
+  const labelledMrp = text => {
+    const got = [];
+    text = text || "";
+    let last = 0;
+    for (const m of text.matchAll(RUPEE)) {
+      const before = text.slice(Math.max(last, m.index - 40), m.index);
+      last = m.index + m[0].length;
+      if (!MRP_WORD.test(before) || /save|discount|\boff\b|-\s*$/i.test(before)) continue;
+      const v = parseFloat(m[1].replace(/,/g, ""));
+      if (v > 0) got.push(v);
+    }
+    return got;
+  };
   const struckIn = root => {
     const got = [];
     for (const el of root.querySelectorAll("*")) {
@@ -189,6 +206,8 @@ SHOWN_JS = r"""
       }
       out.sell = [...new Set(sell)];
       out.struck = [...new Set(struck)];
+      // The MRP a shopper is shown: struck through, or labelled "MRP".
+      out.mrp = [...new Set([...struck, ...labelledMrp(text)])];
       out.level = level;
       out.foreign = FOREIGN.test(text);
       // Stock, from the same block and the one around it (where the
@@ -260,7 +279,7 @@ MARKET_JS = {
   const R = /(?:₹|\bRs\.?)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/;
   const h1 = document.querySelector('h1');
   const out = {h1: h1 ? h1.innerText.trim() : "", sell: [], struck: [], sizes: []};
-  let best = 0, found = [];
+  let best = 0, found = [], at = null;
   for (const el of document.querySelectorAll('body *')) {
     const t = (el.innerText || "").trim();
     if (!t || t.length > 20 || !R.test(t)) continue;
@@ -271,10 +290,26 @@ MARKET_JS = {
     const st = getComputedStyle(el);
     if (st.textDecorationLine.includes('line-through')) continue;
     const fs = parseFloat(st.fontSize) || 0, v = parseFloat(t.match(R)[1].replace(/,/g, ""));
-    if (fs > best + 0.5) { best = fs; found = [v]; }
+    if (fs > best + 0.5) { best = fs; found = [v]; at = el; }
     else if (Math.abs(fs - best) <= 0.5 && !found.includes(v)) found.push(v);
   }
   out.sell = found;
+  // The MRP: the struck-through amount beside that price -- looked for
+  // only in the few blocks around it, never across the page's rails.
+  // Flipkart prints it with no rupee sign ("2,999", struck, 28 Sep 2026).
+  const AMT = /^(?:₹|\bRs\.?)?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)$/;
+  const struck = el => {
+    const t = (el.innerText || "").trim();
+    return t.length <= 20 && AMT.test(t) && !el.children.length &&
+      (["DEL", "S", "STRIKE"].includes(el.tagName) ||
+       getComputedStyle(el).textDecorationLine.includes('line-through'))
+      ? parseFloat(t.match(AMT)[1].replace(/,/g, "")) : 0;
+  };
+  for (let box = at && at.parentElement, up = 0; box && up < 4;
+       box = box.parentElement, up++) {
+    const got = [...new Set([...box.querySelectorAll('*')].map(struck).filter(v => v > 0))];
+    if (got.length) { out.struck = got; break; }
+  }
   return out;
 }""",
 }

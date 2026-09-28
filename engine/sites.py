@@ -577,15 +577,23 @@ def myntra_listing(url):
     # Each size carries its own seller price (sizeSellerData), and it can
     # differ from the product's headline price; a size nobody is selling
     # has none and keeps the headline price, marked unavailable.
-    def size_price(s):
-        got = [_num(x.get("discountedPrice"))
+    # The seller's MRP comes with it, and it too can differ by size
+    # (Vastramay 33061930: 1999 on some sizes, 2199 on others, 28 Sep 2026)
+    # -- that size's MRP, beside the product-level listed_mrp.
+    def size_offer(s):
+        got = [(_num(x.get("discountedPrice")), _num(x.get("mrp")))
                for x in (s.get("sizeSellerData") or [])]
-        got = [p for p in got if p is not None]
-        return min(got) if got else price
-    variants = [Variant(labels=_labels_of(s.get("label")), price=size_price(s),
-                        compare_at=None, available=s.get("available"),
+        got = [g for g in got if g[0] is not None]
+        if not got:
+            return price, None
+        best = min(p for p, _m in got)
+        mrps = {m for p, m in got if p == best and m}
+        return best, (mrps.pop() if len(mrps) == 1 else None)
+    variants = [Variant(labels=_labels_of(s.get("label")), price=p,
+                        compare_at=m, available=s.get("available"),
                         image=hero)
-                for s in (pdp.get("sizes") or [])]
+                for s in (pdp.get("sizes") or [])
+                for p, m in [size_offer(s)]]
     if not variants:
         variants = [Variant(frozenset(), price, None, None, hero)]
     return _listing(url, site, "myntra", ok=True, http_status=r.status_code,
@@ -678,6 +686,33 @@ def _availability(text):
     if "instock" in low or "onlineonly" in low or "limitedavailability" in low:
         return 1
     return None
+
+
+# The MRP a one-price page states in its own markup when its schema.org
+# tag leaves it out (28 Sep 2026): Salesforce's struck list price
+# (biba.in: <span class="strike-through list"><span class="value"
+# content="1999.00">) and Magento's price box (panashindia.com:
+# "oldPrice":{"amount":4883 / data-price-type="oldPrice"
+# data-price-amount="4883"). Information only, like every listed_mrp.
+_PAGE_MRP = (
+    re.compile(r'class="strike-through list">\s*<span class="value" '
+               r'content="([0-9][0-9.]*)"'),
+    re.compile(r'"oldPrice":\{"amount":([0-9][0-9.]*)'),
+    re.compile(r'data-price-amount="([0-9][0-9.]*)"[^>]*'
+               r'data-price-type="oldPrice"'),
+    re.compile(r'data-price-type="oldPrice"[^>]*'
+               r'data-price-amount="([0-9][0-9.]*)"'),
+)
+
+
+def _page_mrp(text, price):
+    """The page's one stated MRP above `price`, or None -- two different
+    ones (another product's box) and nothing is chosen. Pure."""
+    found = {float(x) for rx in _PAGE_MRP for x in rx.findall(text or "")}
+    if price is None or len(found) != 1:
+        return None
+    mrp = found.pop()
+    return mrp if mrp > price else None
 
 
 def _offer_price(offers):
@@ -806,6 +841,8 @@ def _read_page(url, r, platform, site, note="", page_facts=None):
         price, mrp, stock = _offer_price(d.get("offers") or {})
         if price is None:
             continue
+        if mrp is None:
+            mrp = _page_mrp(r.text, price)
         shots = _all_ldjson_images(d.get("image"))
         image = shots[0] if shots else None
         offers = _offer_variants(d.get("offers") or {}, image)
@@ -1821,10 +1858,41 @@ def flipkart_listing(url):
     One price per listing and no per-size breakdown, so per_size is False --
     the same honesty the Hopscotch reader keeps.
     """
-    return ldjson_listing(
+    body = {}
+
+    def facts(text):
+        body["text"] = text
+        return _flipkart_facts(text, url)
+    lst = ldjson_listing(
         url, platform="flipkart", site="flipkart.com",
         note="product-level price; Flipkart publishes one price per listing",
-        page_facts=lambda body: _flipkart_facts(body, url))
+        page_facts=facts)
+    if lst.ok and lst.listed_mrp is None and lst.variants:
+        mrp = _flipkart_mrp(body.get("text", ""), lst.variants[0].price)
+        if mrp:
+            lst = lst._replace(listed_mrp=mrp)
+    return lst
+
+
+# Flipkart's schema.org Product has no MRP. The page's own pricing record
+# does: "ppd":{"fsp":1344,"finalPrice":1424,"mrp":2999,...} (28 Sep 2026),
+# fsp being the price the schema.org block states. Other products' cards
+# can carry records of their own, so only a record whose fsp IS this price
+# counts, and only when every such record names one MRP.
+_FK_PPD = re.compile(r'"ppd":\{([^{}]*)\}')
+
+
+def _flipkart_mrp(body, price):
+    """The listing's MRP from its pricing record, or None. Pure."""
+    found = set()
+    for m in _FK_PPD.finditer(body or ""):
+        fsp = re.search(r'"fsp":\s*([0-9.]+)', m.group(1))
+        mrp = re.search(r'"mrp":\s*([0-9.]+)', m.group(1))
+        if fsp and mrp and price is not None and \
+                abs(float(fsp.group(1)) - price) < 0.01:
+            found.add(float(mrp.group(1)))
+    mrp = found.pop() if len(found) == 1 else None
+    return mrp if mrp and mrp >= price else None
 
 
 # Flipkart gives every size its own pid; a link without ?pid= opens on a
