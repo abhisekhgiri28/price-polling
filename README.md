@@ -43,7 +43,7 @@ python engine/serve.py                   # opens http://127.0.0.1:8770 in the br
 python engine/serve.py --log             # same, printing each request
 python engine/serve.py --port 8771 --no-open   # a throwaway test server
 python engine/compare.py <file.csv|.xlsx> [-o out.csv]   # no browser, CSV out
-python engine/validate.py                # 329 offline tests (~100 s)
+python engine/validate.py                # 338 offline tests (~100 s)
 python engine/spotcheck.py               # the app's MRP vs the MRP a shopper sees
 python engine/spotcheck.py --recheck spotcheck_<date>.csv   # only the misses
 python engine/weekly.py                  # the weekly health check, by hand
@@ -198,8 +198,17 @@ different pair each week):
   - Myntra from its page data, because it refuses the headless browser.
 - **Failures are retried** after 15 minutes.
 
-It opens `weekly_check_issues_<date>.html` **only when something is wrong**.
-It keeps its results in `checks/` and never writes to the catalogue.
+**When something is wrong, no page opens by itself.** Instead the app's page
+shows a flashing **System Fix !** button (a page already open shows it
+within 30 seconds, without a reload). Clicking it opens the details
+(`/system-fix`): each problem, its brand and channel, a link to the page and
+the day it was found. The button stays until a later check on that brand and
+channel passes: the next Monday's check, or **Run the check again** on the
+details page (`python engine/weekly.py --recheck`). The re-check uses the
+code as it is now: it runs the offline tests first (a failed test is itself
+a problem), then checks **every** brand and channel, so a new problem caused
+by a code change shows on the button too. The open problems are kept in `checks/status.json`. The check keeps
+its results in `checks/` and never writes to the catalogue.
 
 ## Files
 
@@ -214,5 +223,5 @@ It keeps its results in `checks/` and never writes to the catalogue.
 | `engine/browser.py` | The headless-browser reader (last resort), plus the page scripts the checks use |
 | `engine/spotcheck.py` | The MRP spot-check |
 | `engine/weekly.py` | The weekly health check |
-| `engine/validate.py` | 329 offline tests |
+| `engine/validate.py` | 338 offline tests |
 | `data/brand_catalogue.xlsx` | The saved brands (one sheet per brand): barcodes, Zoddle prices, MRPs, each marketplace's link |

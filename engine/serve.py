@@ -22,12 +22,12 @@ not something to expose on a network interface.
 import sys, os, re, io, json, html, uuid, pathlib, argparse, threading
 import urllib.parse
 import collections
-import webbrowser, datetime, time
+import webbrowser, datetime, time, subprocess
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import linkfile, compare, sites, catalogue
+import linkfile, compare, sites, catalogue, weekly
 
 MAX_UPLOAD = 32 * 1024 * 1024
 JOBS = {}
@@ -371,6 +371,17 @@ td.low a{color:var(--good)}
 .dialog ul{margin:0 0 12px;padding-left:18px;font-size:14px}
 .dialog .hint{font-size:13px;color:var(--muted);margin:10px 0 6px}
 .dialog .actions{display:flex;gap:10px;justify-content:flex-end;margin-top:14px}
+.sysfix{position:fixed;top:14px;right:16px;z-index:50;font:800 15px/1
+ "Helvetica Neue",Arial,sans-serif;padding:12px 18px;border-radius:5px;
+ background:#c62828;color:#fff;border:2px solid #7f1414;text-decoration:none;
+ box-shadow:0 2px 10px rgba(0,0,0,.25);animation:sysfix 1s steps(1) infinite}
+@keyframes sysfix{50%{background:#fff;color:#c62828}}
+@media (prefers-reduced-motion:reduce){.sysfix{animation:none}}
+.fixlist{list-style:none;padding:0;margin:0 0 18px}
+.fixlist li{background:var(--panel);border:1px solid var(--line);
+ border-left:4px solid var(--bad);border-radius:4px;padding:11px 14px;
+ margin:0 0 8px}
+.fixlist .when{color:var(--muted);font-size:13px}
 footer{margin-top:40px;padding-top:15px;border-top:1px solid var(--line);
  font:400 12px/1.6 ui-monospace,Consolas,monospace;color:var(--faint)}
 """
@@ -465,7 +476,7 @@ def home(flash="", job=None, view="table"):
                 'first</option>')
         off = " disabled"
 
-    body = flash + """
+    body = system_fix_button() + flash + """
 <div class="start">
 <form id="form" method="POST" action="/upload" enctype="multipart/form-data">
   <div class="drop" id="drop">
@@ -500,7 +511,7 @@ def home(flash="", job=None, view="table"):
 
     section, script = result_section(job, view)
     return page("Live price polling", "Live marketplace prices", "",
-                body + section, DROP_JS + script)
+                body + section, DROP_JS + SYSFIX_JS + script)
 
 
 def _shot(url, caption):
@@ -935,6 +946,107 @@ def skipped_notice(issues):
 
 
 # ------------------------------------------------------------------ handler --
+# ------------------------------------------------------------- System Fix --
+# Abhisekh, 29 Sep 2026: instead of the weekly check opening a report page,
+# a flashing "System Fix !" button on this page; clicking it opens the
+# details; it stays until the problem is fixed AND a check has passed on it.
+# The open problems live in checks/status.json (weekly.save_status).
+
+RECHECK_LOCK = threading.Lock()
+RECHECK_STARTED = [0.0]
+
+
+# A page left open shows (or drops) the button by itself: it asks every
+# 30 seconds whether a problem is open. No reload needed.
+SYSFIX_JS = """<script>
+setInterval(()=>{fetch('/system-fix/state').then(r=>r.json()).then(s=>{
+  const b=document.querySelector('a.sysfix');
+  if(s.open&&!b){const a=document.createElement('a');a.className='sysfix';
+    a.href='/system-fix';a.textContent='System Fix !';
+    a.title='The weekly check found a problem -- click for the details';
+    document.body.appendChild(a)}
+  else if(!s.open&&b){b.remove()}}).catch(()=>{})},30000);
+</script>"""
+
+
+def system_fix_button():
+    """The flashing button, only while a weekly-check problem is open."""
+    if not weekly.load_status()["issues"]:
+        return ""
+    return ('<a class="sysfix" href="/system-fix" title="The weekly check '
+            'found a problem -- click for the details">System Fix !</a>')
+
+
+def start_recheck():
+    """Run `weekly.py --recheck` in its own process, so it finishes even if
+    this app is closed. False when a check is already running."""
+    with RECHECK_LOCK:
+        if (not weekly.load_status()["issues"] or weekly.running_since()
+                or time.time() - RECHECK_STARTED[0] < 30):
+            return False
+        RECHECK_STARTED[0] = time.time()
+        subprocess.Popen(
+            [sys.executable, str(HERE / "weekly.py"), "--recheck"],
+            cwd=str(HERE.parent), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return True
+
+
+def system_fix_page():
+    st = weekly.load_status()
+    issues = st["issues"]
+    since = weekly.running_since() or (
+        "just now" if time.time() - RECHECK_STARTED[0] < 30 else None)
+    head = ('<meta http-equiv="refresh" content="20">' if since else "")
+    last = ("Last check: %s (%s)." % (e(st.get("checked") or "?"),
+                                      e(st.get("what") or "weekly"))
+            if st.get("checked") else "")
+    if since:
+        action = ('<p><b>A check is running</b> (started %s). This page '
+                  'refreshes by itself; the button goes away once the check '
+                  'passes.</p>' % e(since))
+    elif issues:
+        action = ('<form method="POST" action="/system-fix/recheck">'
+                  '<button type="submit">Run the check again</button></form>'
+                  '<p class="hint">Once it is fixed: this runs the code\'s '
+                  'own tests, then checks EVERY brand and channel, so a new '
+                  'problem the change caused shows here too (about 6 '
+                  'minutes; a link that still fails is tried again 15 '
+                  'minutes later). It uses the code as it is now, and keeps '
+                  'running even if you close the app.</p>')
+    else:
+        action = ""
+    if not issues:
+        body = ('<p>Nothing to fix &mdash; every brand and channel passed '
+                'the last check. %s</p><p><a class="btn ghost" href="/">'
+                'Back to prices</a></p>' % last) + action
+        return page("System Fix", "System Fix", "", body, head=head)
+    by = collections.OrderedDict()
+    for i in issues:
+        by.setdefault(i.get("kind") or "Problem", []).append(i)
+    parts = []
+    for kind, items in by.items():
+        lis = "".join(
+            '<li><b>%s</b>%s &mdash; %s%s<div class="when">found %s</div></li>'
+            % (e(i.get("brand") or "The weekly check"),
+               (" &middot; " + e(i["channel"])) if i.get("channel") else "",
+               e(i.get("detail") or ""),
+               (' &nbsp;<a href="%s" target="_blank" rel="noopener">open '
+                'page &#8599;</a>' % e(i["link"])) if i.get("link") else "",
+               e(i.get("found") or "?"))
+            for i in items)
+        parts.append('<h2>%s (%d)</h2><ul class="fixlist">%s</ul>'
+                     % (e(kind), len(items), lis))
+    body = ('<p>%s Only what could not be read correctly is listed; '
+            'everything else passed.</p>%s%s<p><a class="btn ghost" href="/">'
+            'Back to prices</a></p>') % (last, "".join(parts), action)
+    n = len(issues)
+    return page("System Fix", "System Fix: %d problem%s" % (n, "" if n == 1
+                                                            else "s"),
+                "", body, head=head)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ZocsPriceWatch/3.0"
 
@@ -1015,6 +1127,14 @@ class Handler(BaseHTTPRequestHandler):
                 view = "cards" if "view=cards" in self.path else "table"
                 self._send(200, job_page(job, view))
                 return
+            if path == "/system-fix":
+                self._send(200, system_fix_page())
+                return
+            if path == "/system-fix/state":
+                self._send(200, json.dumps(
+                    {"open": len(weekly.load_status()["issues"])}),
+                    "application/json")
+                return
             if path == "/template.csv":
                 self._send(200, linkfile.template_csv(),
                            "text/csv; charset=utf-8",
@@ -1057,6 +1177,10 @@ class Handler(BaseHTTPRequestHandler):
             if job["state"] == "done" and job["records"]:
                 launch(job)
             self._redirect("/job/%s" % job["id"])
+            return
+        if path == "/system-fix/recheck":
+            start_recheck()
+            self._redirect("/system-fix")
             return
         if path == "/fetch":
             try:

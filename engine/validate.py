@@ -2581,6 +2581,68 @@ def weekly_check(k):
     k.ok("weekly: a channel that reads but could not be spot-checked is reported",
          [i[0] for i in unchecked] == ["Spot-check could not be done"], unchecked)
 
+    # -- System Fix (Abhisekh, 29 Sep 2026): a button, not a report page;
+    #    a problem stays until a check on its brand and channel passes.
+    amz = weekly.as_issue(("Not readable", "B", "Amazon", "not fetched", "u1"),
+                          "2026-10-05")
+    web = weekly.as_issue(("Not readable", "C", "Website", "not fetched", "u2"),
+                          "2026-10-05")
+    again = weekly.as_issue(("Not readable", "B", "Amazon", "not fetched", "u1"),
+                            "2026-10-12")
+    k.ok("system fix: a full check that passes clears every problem",
+         weekly.merge_status([amz, web], [], None) == [])
+    k.ok("system fix: a recheck of B/Amazon that passes clears only that one",
+         weekly.merge_status([amz, web], [], {("B", "Amazon")}) == [web])
+    k.ok("system fix: a problem found again keeps the day it was first found",
+         [i["found"] for i in weekly.merge_status([amz], [again], None)]
+         == ["2026-10-05"])
+    import serve, tempfile
+    real = weekly.CHECKS
+    try:
+        weekly.CHECKS = pathlib.Path(tempfile.mkdtemp())
+        none_page = serve.home()
+        weekly.save_status([], [amz], None, "1 brand", "full")
+        one_page, details = serve.home(), serve.system_fix_page()
+        weekly.save_status(weekly.load_status()["issues"], [], None, "", "full")
+        cleared = serve.home()
+    finally:
+        weekly.CHECKS = real
+    k.ok("system fix: no button while nothing is wrong",
+         'class="sysfix"' not in none_page)
+    k.ok("system fix: an open page asks for the button by itself (no reload)",
+         "/system-fix/state" in none_page and "/system-fix/state" in one_page)
+    k.ok("system fix: the flashing button shows while a problem is open, and "
+         "the details page names it with a re-check button",
+         'class="sysfix"' in one_page and "System Fix: 1 problem" in details
+         and "Run the check again" in details and "u1" in details)
+    k.ok("system fix: the button goes once a check passes", 'class="sysfix"'
+         not in cleared)
+    # The re-check: the code's tests first, then EVERY brand and channel.
+    real_rt, real_pools = weekly.run_tests, weekly.pools
+    asked = []
+    try:
+        weekly.CHECKS = pathlib.Path(tempfile.mkdtemp())
+        weekly.save_status([], [amz], None, "", "full")
+        weekly.run_tests = lambda: ["a test -- its detail"]
+        weekly.pools = lambda brands=None: asked.append(brands) or {}
+        weekly.run(recheck=True, retry_after=0)
+        after_fail = [(i["brand"], i["kind"])
+                      for i in weekly.load_status()["issues"]]
+        live_skipped = asked == []
+        weekly.run_tests = lambda: []
+        weekly.run(recheck=True, retry_after=0)
+        after_pass = weekly.load_status()["issues"]
+    finally:
+        weekly.CHECKS, weekly.run_tests, weekly.pools = real, real_rt, real_pools
+    k.ok("system fix: a re-check whose tests fail keeps the old problem, adds "
+         "the failed tests, and does not run the live check",
+         after_fail == [("B", "Not readable"),
+                        (weekly.TESTS_BRAND, "The code's own tests failed")]
+         and live_skipped, (after_fail, asked))
+    k.ok("system fix: a re-check whose tests pass checks EVERY brand and "
+         "channel (not only the listed ones) and clears what passed",
+         asked == [None] and after_pass == [], (asked, after_pass))
+
     # -- the spot-check on marketplaces
     import spotcheck, browser
     my = spotcheck.myntra_summary('<meta name="description" content="Buy VASTRAMAY '

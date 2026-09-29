@@ -26,13 +26,22 @@ is a HEALTH check, not a product audit:
     the headless browser). A channel that reads but could not be
     spot-checked is reported too.
 
-It reports ONLY when something fails: weekly_check_issues_<date>.html in
-the project folder, opened in the browser. When all is well nothing is
-shown. Each week's results go to checks/<date>.json and one line to
-checks/log.txt. It never writes to the brand catalogue.
+It reports ONLY when something fails -- and no page opens by itself
+(Abhisekh, 29 Sep 2026): the open problems are kept in checks/status.json,
+and the app's page (serve.py) shows a flashing "System Fix !" button for
+as long as any is open. The button opens the details (/system-fix). A
+problem stays open until a later check on its brand and channel passes:
+the next Monday's check, or "Run the check again" on the details page
+(python engine/weekly.py --recheck). The re-check first runs the code's
+own tests (validate.py), then checks EVERY brand and channel, so a new
+problem a code change caused is caught too (Abhisekh, 29 Sep 2026); a
+failed test is itself a problem, and the live check then waits for the
+tests to pass. When all is well nothing is shown. Each week's results go
+to checks/<date>.json and one line to checks/log.txt. It never writes to
+the brand catalogue.
 """
 import sys, json, time, random, datetime, pathlib, collections, html
-import argparse, traceback, urllib.parse, webbrowser
+import argparse, traceback, urllib.parse
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -47,6 +56,66 @@ CHANNEL_NAME = {"own site": "Website", "myntra": "Myntra",
                 "firstcry": "FirstCry", "amazon": "Amazon",
                 "flipkart": "Flipkart", "hopscotch": "Hopscotch"}
 READ_FAILURES = ("not fetched", "check page", "not in rupees", "not allowed")
+RUNNING_STALE_SECONDS = 4 * 3600   # a "running" mark older than this is dead
+
+
+def status_path():
+    """checks/status.json: the open problems. A function, not a constant,
+    so a demo that points CHECKS elsewhere never touches the real one."""
+    return CHECKS / "status.json"
+
+
+def running_path():
+    return CHECKS / "running.json"
+
+
+def load_status():
+    """{"checked": ..., "stats": ..., "issues": [dict, ...]} -- the open
+    problems the app's "System Fix !" button shows. Empty when none."""
+    try:
+        st = json.loads(status_path().read_text(encoding="utf-8"))
+        if isinstance(st.get("issues"), list):
+            return st
+    except (OSError, ValueError):
+        pass
+    return {"checked": None, "stats": "", "issues": []}
+
+
+def running_since():
+    """The time ("HH:MM") a check now running started, else None."""
+    try:
+        st = json.loads(running_path().read_text(encoding="utf-8"))
+        if time.time() - float(st["t"]) < RUNNING_STALE_SECONDS:
+            return st["at"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def as_issue(t, found):
+    kind, brand, chan, detail, link = t
+    return {"kind": kind, "brand": brand, "channel": chan, "detail": detail,
+            "link": link, "found": found}
+
+
+def merge_status(old, new, checked):
+    """The problems still open after a check. Pure, tested offline.
+
+    old, new: [issue dict]. checked: None for a full check (every old
+    problem is replaced by what it found), else the (brand, channel) pairs
+    this check covered -- their old problems are replaced, the others stay
+    open. A problem found again keeps the day it was first found."""
+    first = {(i["kind"], i["brand"], i["channel"], i["link"]): i.get("found")
+             for i in old}
+    kept = ([] if checked is None else
+            [i for i in old if (i["brand"], i["channel"]) not in checked])
+    out = []
+    for i in new:
+        i = dict(i)
+        i["found"] = first.get((i["kind"], i["brand"], i["channel"],
+                                i["link"])) or i.get("found")
+        out.append(i)
+    return kept + out
 
 
 def pools(brands=None):
@@ -128,16 +197,74 @@ def _check_group(brand, chan, links, rnd):
     return results
 
 
-def run(open_report=True, only=None, retry_after=RETRY_AFTER_SECONDS,
+def run(only=None, recheck=False, retry_after=RETRY_AFTER_SECONDS,
         seed=None):
+    """(status file or None, this check's issues). only: one brand (a
+    trial); recheck: the code's tests, then every brand and channel."""
+    CHECKS.mkdir(exist_ok=True)
+    now = datetime.datetime.now()
+    running_path().write_text(json.dumps(
+        {"t": time.time(), "at": now.strftime("%H:%M")}), encoding="utf-8")
+    try:
+        return _run(only, recheck, retry_after, seed)
+    finally:
+        try:
+            running_path().unlink()
+        except OSError:
+            pass
+
+
+TESTS_BRAND = "Code tests"
+
+
+def run_tests():
+    """The offline tests (validate.py) in their own process: [] when all
+    pass, else a line per failed test (or why they could not run)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            [sys.executable, str(HERE / "validate.py")], cwd=str(ROOT),
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=1800,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as ex:
+        return ["the tests could not be run: %r" % (ex,)]
+    failed = [l.strip()[len("FAILED: "):] for l in out.stdout.splitlines()
+              if l.strip().startswith("FAILED: ")]
+    if out.returncode and not failed:
+        tail = (out.stderr or out.stdout).strip().splitlines()
+        failed = ["the tests stopped: %s" % (tail[-1] if tail else
+                                              "exit code %d" % out.returncode)]
+    return failed
+
+
+def _run(only, recheck, retry_after, seed):
     day = datetime.date.today().isoformat()
     t0 = time.time()
-    CHECKS.mkdir(exist_ok=True)
+    old = load_status()["issues"]
+    if recheck:
+        # Abhisekh, 29 Sep 2026: after a code change the re-check must also
+        # catch a NEW problem the change caused. So: the code's own tests
+        # first, then EVERY brand and channel -- not only the listed ones.
+        failures = run_tests()
+        if failures:
+            save_status(old, [as_issue(("The code's own tests failed",
+                                        TESTS_BRAND, "", f, ""), day)
+                              for f in failures],
+                        {(TESTS_BRAND, "")}, "%d test(s) failed; the live "
+                        "check was not run" % len(failures), "re-check")
+            return status_path(), []
     sites.new_run()
     # A different sample each week, the same one if re-run the same week.
     rnd = random.Random(seed if seed is not None
                         else datetime.date.today().isocalendar()[1])
     groups = pools([only] if only else None)
+    name = lambda chan: CHANNEL_NAME.get(chan, chan.title())
+    checked = None                       # a full check replaces everything
+    if only:
+        checked = ({(b, name(c)) for b, c in groups} |
+                   {(i["brand"], i["channel"]) for i in old
+                    if i["brand"].lower() == only.lower()})
     results = collections.OrderedDict()
     for (brand, chan), links in groups.items():
         results[(brand, chan)] = _check_group(brand, chan, links, rnd)
@@ -164,56 +291,39 @@ def run(open_report=True, only=None, retry_after=RETRY_AFTER_SECONDS,
         "day": day, "stats": stats,
         "results": {"%s|%s" % k: rs for k, rs in results.items()},
         "issues": issues}, indent=1, default=str), encoding="utf-8")
+    what = ("re-check (tests + every brand and channel)" if recheck
+            else "check of %s only" % only if only else "full check")
+    open_now = save_status(old, [as_issue(i, day) for i in issues],
+                           checked, stats, what)
     with open(CHECKS / "log.txt", "a", encoding="utf-8") as f:
-        f.write("%s  %d issue(s)  %s\n" % (day, len(issues), stats))
-    if issues:
-        path = _report(issues, day, stats)
-        if open_report:
-            webbrowser.open(path.as_uri())
-        return path, issues
-    return None, issues
+        f.write("%s  %d issue(s)  %s  (%s; %d still open)\n"
+                % (day, len(issues), stats, what, len(open_now)))
+    return (status_path() if open_now else None), issues
 
 
-def _report(issues, day, stats):
-    by = collections.OrderedDict()
-    for kind, brand, chan, detail, link in issues:
-        by.setdefault(kind, []).append((brand, chan, detail, link))
-    parts = []
-    for kind, items in by.items():
-        lis = "".join(
-            "<li><b>%s</b>%s &mdash; %s%s</li>" % (
-                html.escape(b), (" &middot; " + html.escape(c)) if c else "",
-                html.escape(d),
-                (' &nbsp;<a href="%s" target="_blank">open page</a>'
-                 % html.escape(l)) if l else "")
-            for b, c, d, l in items)
-        parts.append("<h2>%s (%d)</h2><ul>%s</ul>" % (html.escape(kind),
-                                                       len(items), lis))
-    body = ("<!doctype html><meta charset='utf-8'><title>Weekly check: %d "
-            "issues</title><style>body{font:15px/1.5 system-ui,sans-serif;"
-            "max-width:1000px;margin:24px auto;padding:0 16px;color:#222}"
-            "h1{font-size:22px}h2{font-size:17px;margin-top:28px}"
-            "li{margin:6px 0}a{color:#0b57d0}.s{color:#666}</style>"
-            "<h1>Weekly check, %s: %d problem%s</h1>"
-            "<p class='s'>%s. Only brands or channels that could not be read "
-            "correctly are listed; everything else passed.</p>%s") % (
-        len(issues), day, len(issues), "" if len(issues) == 1 else "s",
-        html.escape(stats), "".join(parts))
-    path = ROOT / ("weekly_check_issues_%s.html" % day)
-    path.write_text(body, encoding="utf-8")
-    return path
+def save_status(old, new, checked, stats, what):
+    """Write checks/status.json -- what the app's button reads."""
+    open_now = merge_status(old, new, checked)
+    status_path().write_text(json.dumps({
+        "checked": datetime.datetime.now().strftime("%d %b %Y, %H:%M"),
+        "what": what, "stats": stats, "issues": open_now},
+        indent=1), encoding="utf-8")
+    return open_now
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="the weekly health check")
     ap.add_argument("--brand", help="only this brand (a trial)")
+    ap.add_argument("--recheck", action="store_true",
+                    help="the code's tests, then every brand and channel "
+                    "(the app's \"Run the check again\")")
     ap.add_argument("--no-open", action="store_true",
-                    help="do not open the report page")
+                    help="no longer does anything: no page opens by itself")
     ap.add_argument("--no-retry-wait", action="store_true",
                     help="retry failures at once (a quick trial)")
     a = ap.parse_args(argv)
     try:
-        path, issues = run(open_report=not a.no_open, only=a.brand,
+        path, issues = run(only=a.brand, recheck=a.recheck,
                            retry_after=0 if a.no_retry_wait
                            else RETRY_AFTER_SECONDS)
     except Exception:
@@ -223,10 +333,12 @@ def main(argv=None):
         err = traceback.format_exc()
         with open(CHECKS / "log.txt", "a", encoding="utf-8") as f:
             f.write("%s  CHECK FAILED\n%s\n" % (day, err))
-        p = _report([("The weekly check itself failed", "", "",
-                      err.strip().splitlines()[-1], "")], day,
-                    "see checks/log.txt for the details")
-        webbrowser.open(p.as_uri())
+        # Kept open (beside the others) until a full check runs cleanly.
+        save_status(load_status()["issues"],
+                    [as_issue(("The weekly check itself failed", "", "",
+                               err.strip().splitlines()[-1] +
+                               " -- see checks/log.txt", ""), day)],
+                    {("", "")}, "the check stopped before it finished", "failed check")
         return 1
     print("%d issue(s)%s" % (len(issues), (" -- " + str(path)) if path else ""))
     return 0
