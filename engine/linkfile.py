@@ -300,13 +300,20 @@ def priced_csv(table, prices, lowest=None, drop_headings=("last_updated",)):
     return buf.getvalue()
 
 
-def priced_xlsx(table, prices, lowest=None, drop_headings=("last_updated",)):
+def priced_xlsx(table, prices, lowest=None, drop_headings=("last_updated",),
+                links=None):
     """The priced file as an Excel workbook (bytes): the same rows as the
     CSV, with prices stored as numbers and every "-" centred in its cell
-    (Abhisekh, 24 Sep 2026 -- a CSV cannot carry alignment)."""
+    (Abhisekh, 24 Sep 2026 -- a CSV cannot carry alignment).
+
+    Every price -- and "out of stock" / "not fetched" -- is a link to the
+    page it was read from (Abhisekh, 30 Sep 2026), as on the app's page:
+    `links` maps (barcode, channel) -> that page, and `lowest` may carry
+    the Lowest price's page as a third item. A CSV cannot carry links."""
     import openpyxl
     from openpyxl.styles import Alignment, Font
-    head, rows, numeric = priced_rows(table, prices, lowest, drop_headings)
+    head, rows, numeric, hrefs = _priced(table, prices, lowest,
+                                         drop_headings, links)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Live prices"
@@ -318,14 +325,17 @@ def priced_xlsx(table, prices, lowest=None, drop_headings=("last_updated",)):
         m = _money(v)                   # "1,299" / "Rs 1299" -> 1299.0
         return v if m is None else (int(m) if m == int(m) else m)
 
-    for r in rows:
+    for n, r in enumerate(rows):
         ws.append([num(v) if j in numeric and v != NA
                    and not isinstance(v, Kept) else str(v)
                    if isinstance(v, Kept) else v
                    for j, v in enumerate(r)])
-        for c in ws[ws.max_row]:
+        for j, c in enumerate(ws[ws.max_row]):
             if c.value == NA:
                 c.alignment = centre
+            elif (n, j) in hrefs:
+                c.hyperlink = hrefs[(n, j)]
+                c.style = "Hyperlink"
     for j, h in enumerate(head, start=1):
         width = max([len(str(h))] + [len(str(r[j - 1])) for r in rows])
         ws.column_dimensions[openpyxl.utils.get_column_letter(j)].width = \
@@ -351,7 +361,17 @@ def priced_rows(table, prices, lowest=None, drop_headings=("last_updated",)):
     `prices` maps (barcode, channel) -> price; `lowest` maps barcode ->
     (price, source name).
     """
+    return _priced(table, prices, lowest, drop_headings)[:3]
+
+
+def _priced(table, prices, lowest=None, drop_headings=("last_updated",),
+            page_links=None):
+    """priced_rows, plus {(output row, column): page} for every cell that
+    shows a price or a word, from `page_links` ((barcode, channel) -> page)
+    and the third item of a `lowest` entry, when given."""
     head_at, header, col, links = layout(table)
+    page_links = page_links or {}
+    hrefs = {}
     lowest = lowest or {}
     drop = {col[f] for f in ("image", "name", "color") if f in col}
     drop |= {i for i, h in enumerate(header)
@@ -404,11 +424,20 @@ def priced_rows(table, prices, lowest=None, drop_headings=("last_updated",)):
             if i in money:
                 return cells[i] or NA
             return cells[i]
-        low_price, low_source = (("", "") if repeat
-                                 else lowest.get(barcode, ("", "")))
-        out.append([cell(i) for i in keep]
-                   + [_price_text(low_price) or NA, low_source or NA])
-    return head, out, numeric
+        low = ("", "") if repeat else tuple(lowest.get(barcode, ("", "")))
+        low_price, low_source = low[:2]
+        line = ([cell(i) for i in keep]
+                + [_price_text(low_price) or NA, low_source or NA])
+        for j, i in enumerate(keep):
+            page = (page_links.get((barcode, link_ch[i]))
+                    if i in link_ch else None)
+            if page and line[j] != NA and cells[i].strip() and not repeat \
+                    and is_link(cells[i]):
+                hrefs[(len(out), j)] = page
+        if len(low) > 2 and low[2] and line[len(keep)] != NA:
+            hrefs[(len(out), len(keep))] = low[2]
+        out.append(line)
+    return head, out, numeric, hrefs
 
 
 def parse_table(table, filename=""):

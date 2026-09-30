@@ -1,6 +1,6 @@
 """Spot-check: is the MRP we read the MRP a shopper sees?
 
-Abhisekh, 28 Sep 2026: the spot-check, and the weekly check that uses it,
+Abhisekh, 28 Sep 2026: the spot-check, and the daily check that uses it,
 compare the MRP, not the selling price (a run still reports the selling
 price). For every own-website link it is given, this reads the page the
 app's way (`sites.fetch_listing`) and ALSO loads it in a headless browser,
@@ -147,7 +147,7 @@ def page_mrps(shown):
 
 def verdict(app, shown):
     """(verdict, app MRPs, page MRPs) for one link. Abhisekh, 28 Sep 2026:
-    the spot-check and the weekly check compare the MRP, not the selling
+    the spot-check and the daily check compare the MRP, not the selling
     price. (A run still reports the selling price.)"""
     got, seen = app_mrps(app), page_mrps(shown)
     if not got and not seen:

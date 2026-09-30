@@ -1,7 +1,7 @@
-"""The weekly check: can the app still read every brand, on every channel?
+"""The daily check: can the app still read every brand, on every channel?
 
-Run by Windows Task Scheduler every Monday at 11 am, or by hand:
-    python engine/weekly.py
+Run by Windows Task Scheduler every day at 11:15 am, or by hand:
+    python engine/daily.py
 
 Abhisekh, 28 Sep 2026: its purpose is that "every brand is readable and
 the system doesn't fail on any brand, as well as marketplaces". Dead links
@@ -10,7 +10,7 @@ is a HEALTH check, not a product audit:
 
   * For every saved brand and every channel it links (its own website,
     Myntra, FirstCry, Amazon, Flipkart ...), up to SAMPLE random links are
-    read the app's way -- a different few each week.
+    read the app's way -- a different few each day.
   * A link READS when the app gets a price from it (sold out included).
     A product that is gone or does not sell the size is an answer about
     the product, not the site: another link is tried instead.
@@ -31,12 +31,12 @@ It reports ONLY when something fails -- and no page opens by itself
 and the app's page (serve.py) shows a flashing "System Fix !" button for
 as long as any is open. The button opens the details (/system-fix). A
 problem stays open until a later check on its brand and channel passes:
-the next Monday's check, or "Run the check again" on the details page
-(python engine/weekly.py --recheck). The re-check first runs the code's
+the next day's check, or "Run the check again" on the details page
+(python engine/daily.py --recheck). The re-check first runs the code's
 own tests (validate.py), then checks EVERY brand and channel, so a new
 problem a code change caused is caught too (Abhisekh, 29 Sep 2026); a
 failed test is itself a problem, and the live check then waits for the
-tests to pass. When all is well nothing is shown. Each week's results go
+tests to pass. When all is well nothing is shown. Each day's results go
 to checks/<date>.json and one line to checks/log.txt. It never writes to
 the brand catalogue.
 """
@@ -255,9 +255,9 @@ def _run(only, recheck, retry_after, seed):
                         "check was not run" % len(failures), "re-check")
             return status_path(), []
     sites.new_run()
-    # A different sample each week, the same one if re-run the same week.
+    # A different sample each day, the same one if re-run the same day.
     rnd = random.Random(seed if seed is not None
-                        else datetime.date.today().isocalendar()[1])
+                        else datetime.date.today().toordinal())
     groups = pools([only] if only else None)
     name = lambda chan: CHANNEL_NAME.get(chan, chan.title())
     checked = None                       # a full check replaces everything
@@ -312,7 +312,7 @@ def save_status(old, new, checked, stats, what):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="the weekly health check")
+    ap = argparse.ArgumentParser(description="the daily health check")
     ap.add_argument("--brand", help="only this brand (a trial)")
     ap.add_argument("--recheck", action="store_true",
                     help="the code's tests, then every brand and channel "
@@ -335,7 +335,7 @@ def main(argv=None):
             f.write("%s  CHECK FAILED\n%s\n" % (day, err))
         # Kept open (beside the others) until a full check runs cleanly.
         save_status(load_status()["issues"],
-                    [as_issue(("The weekly check itself failed", "", "",
+                    [as_issue(("The daily check itself failed", "", "",
                                err.strip().splitlines()[-1] +
                                " -- see checks/log.txt", ""), day)],
                     {("", "")}, "the check stopped before it finished", "failed check")

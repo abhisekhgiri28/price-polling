@@ -27,7 +27,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import linkfile, compare, sites, catalogue, weekly
+import linkfile, compare, sites, catalogue, daily
 
 MAX_UPLOAD = 32 * 1024 * 1024
 JOBS = {}
@@ -152,6 +152,7 @@ def launch(job):
             job["rows"], job["summary"] = compare.run(
                 job["records"], progress=progress, fetched=job["fetched"])
             job["finished"] = time.monotonic()
+            job["fetched_on"] = datetime.date.today()   # the download's name
             job["state"] = "done"
         except Exception as e:
             job["state"] = "failed"
@@ -377,6 +378,12 @@ td.low a{color:var(--good)}
  box-shadow:0 2px 10px rgba(0,0,0,.25);animation:sysfix 1s steps(1) infinite}
 @keyframes sysfix{50%{background:#fff;color:#c62828}}
 @media (prefers-reduced-motion:reduce){.sysfix{animation:none}}
+.verified{position:fixed;top:14px;right:16px;z-index:50;display:flex;
+ align-items:center;gap:8px;padding:8px 14px;border-radius:5px;
+ background:var(--good-soft);color:var(--good);border:1px solid var(--good);
+ text-decoration:none;font:700 14px/1.2 "Helvetica Neue",Arial,sans-serif}
+.verified .tick{font-size:18px}
+.verified small{display:block;font:500 11px/1.2 inherit;color:var(--muted)}
 .fixlist{list-style:none;padding:0;margin:0 0 18px}
 .fixlist li{background:var(--panel);border:1px solid var(--line);
  border-left:4px solid var(--bad);border-radius:4px;padding:11px 14px;
@@ -661,13 +668,18 @@ def _lowest_price_cell(row):
     alone. Zoddle's own price, or a tie, has no single page to open."""
     if row.lowest_price in (None, ""):
         return "&mdash;"
+    return "<strong>%s</strong>" % _price_cell(
+        row.lowest_price, lowest_link(row), row.lowest_source)
+
+
+def lowest_link(row):
+    """The page of the cheapest price, when one marketplace holds it alone;
+    "" for Zoddle's own price or a tie (no single page to open)."""
     heads = lowest_headings(row)
-    link = ""
-    if len(heads) == 1:
-        chan = next((c for c in CHANNEL_VIEW if c[0] in heads), None)
-        link = getattr(row, chan[2]) if chan and chan[2] else ""
-    return "<strong>%s</strong>" % _price_cell(row.lowest_price, link,
-                                               row.lowest_source)
+    if len(heads) != 1 or row.lowest_price in (None, ""):
+        return ""
+    chan = next((c for c in CHANNEL_VIEW if c[0] in heads), None)
+    return getattr(row, chan[2]) if chan and chan[2] else ""
 
 
 _ORDER = ["Zoddle"] + [c[0] for c in CHANNEL_VIEW] + ["Other"]
@@ -865,6 +877,34 @@ def price_map(rows):
     return out
 
 
+def link_map(rows):
+    """(barcode, channel) -> the page each download cell was read from --
+    the same page the app's cell links to (for Amazon and Flipkart, the
+    row's own size's page)."""
+    out = {}
+    view = {c[1]: c for c in CHANNEL_VIEW}
+    for r in rows:
+        for ch, f in CHANNEL_FIELD.items():
+            link = getattr(r, view[f][2])
+            if link:
+                out[(r.zoddle_barcode, ch)] = link
+    return out
+
+
+def download_name(job):
+    """The download's file name without extension: the brand's name and
+    the day of the live fetch, "Bhama_30-09-2026" (Abhisekh, 30 Sep 2026).
+    A file mixing brands keeps its own name in place of the brand's."""
+    names = {r.brand for r in (job.get("rows") or []) if r.brand}
+    brand = (next(iter(names)) if len(names) == 1 else
+             "" if names else job.get("brand") or "")
+    if not brand:
+        brand = re.sub(r"\.(csv|xlsx|xlsm)$", "", job["filename"], flags=re.I)
+    brand = re.sub(r'[\\/:*?"<>|]+', " ", brand).strip() or "prices"
+    day = job.get("fetched_on") or datetime.date.today()
+    return "%s_%s" % (brand, day.strftime("%d-%m-%Y"))
+
+
 def attachment(name):
     """A Content-Disposition header for any file name. HTTP headers are
     latin-1, so a name with "–" or Hindi in it could not be sent as-is:
@@ -947,10 +987,10 @@ def skipped_notice(issues):
 
 # ------------------------------------------------------------------ handler --
 # ------------------------------------------------------------- System Fix --
-# Abhisekh, 29 Sep 2026: instead of the weekly check opening a report page,
+# Abhisekh, 29 Sep 2026: instead of the daily check opening a report page,
 # a flashing "System Fix !" button on this page; clicking it opens the
 # details; it stays until the problem is fixed AND a check has passed on it.
-# The open problems live in checks/status.json (weekly.save_status).
+# The open problems live in checks/status.json (daily.save_status).
 
 RECHECK_LOCK = threading.Lock()
 RECHECK_STARTED = [0.0]
@@ -960,33 +1000,45 @@ RECHECK_STARTED = [0.0]
 # 30 seconds whether a problem is open. No reload needed.
 SYSFIX_JS = """<script>
 setInterval(()=>{fetch('/system-fix/state').then(r=>r.json()).then(s=>{
-  const b=document.querySelector('a.sysfix');
-  if(s.open&&!b){const a=document.createElement('a');a.className='sysfix';
-    a.href='/system-fix';a.textContent='System Fix !';
-    a.title='The weekly check found a problem -- click for the details';
-    document.body.appendChild(a)}
-  else if(!s.open&&b){b.remove()}}).catch(()=>{})},30000);
+  const b=document.getElementById('wkstate');
+  if(b&&b.outerHTML===s.html)return;
+  if(b)b.remove();
+  if(s.html)document.body.insertAdjacentHTML('beforeend',s.html);
+  }).catch(()=>{})},30000);
 </script>"""
 
 
 def system_fix_button():
-    """The flashing button, only while a weekly-check problem is open."""
-    if not weekly.load_status()["issues"]:
+    """The daily check's mark, top right: the flashing "System Fix !"
+    while a problem is open; else, once a check has passed, a green tick
+    "Verified" with the time of that check -- it stays until the next
+    check (Abhisekh, 30 Sep 2026: "we don't have any clue whether it ran").
+    "" before any check has run."""
+    st = daily.load_status()
+    if st["issues"]:
+        return ('<a class="sysfix" id="wkstate" href="/system-fix" '
+                'title="The daily check found a problem -- click for the '
+                'details">System Fix !</a>')
+    if not st.get("checked"):
         return ""
-    return ('<a class="sysfix" href="/system-fix" title="The weekly check '
-            'found a problem -- click for the details">System Fix !</a>')
+    return ('<a class="verified" id="wkstate" href="/system-fix" title="The '
+            'last daily check passed: %s%s"><span class="tick">&#10004;'
+            '</span><span>Verified<small>%s</small></span></a>'
+            % (e(st.get("what") or "daily check"),
+               (" -- " + e(st["stats"])) if st.get("stats") else "",
+               e(st["checked"])))
 
 
 def start_recheck():
-    """Run `weekly.py --recheck` in its own process, so it finishes even if
+    """Run `daily.py --recheck` in its own process, so it finishes even if
     this app is closed. False when a check is already running."""
     with RECHECK_LOCK:
-        if (not weekly.load_status()["issues"] or weekly.running_since()
+        if (not daily.load_status()["issues"] or daily.running_since()
                 or time.time() - RECHECK_STARTED[0] < 30):
             return False
         RECHECK_STARTED[0] = time.time()
         subprocess.Popen(
-            [sys.executable, str(HERE / "weekly.py"), "--recheck"],
+            [sys.executable, str(HERE / "daily.py"), "--recheck"],
             cwd=str(HERE.parent), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -994,13 +1046,13 @@ def start_recheck():
 
 
 def system_fix_page():
-    st = weekly.load_status()
+    st = daily.load_status()
     issues = st["issues"]
-    since = weekly.running_since() or (
+    since = daily.running_since() or (
         "just now" if time.time() - RECHECK_STARTED[0] < 30 else None)
     head = ('<meta http-equiv="refresh" content="20">' if since else "")
     last = ("Last check: %s (%s)." % (e(st.get("checked") or "?"),
-                                      e(st.get("what") or "weekly"))
+                                      e(st.get("what") or "daily"))
             if st.get("checked") else "")
     if since:
         action = ('<p><b>A check is running</b> (started %s). This page '
@@ -1029,7 +1081,7 @@ def system_fix_page():
     for kind, items in by.items():
         lis = "".join(
             '<li><b>%s</b>%s &mdash; %s%s<div class="when">found %s</div></li>'
-            % (e(i.get("brand") or "The weekly check"),
+            % (e(i.get("brand") or "The daily check"),
                (" &middot; " + e(i["channel"])) if i.get("channel") else "",
                e(i.get("detail") or ""),
                (' &nbsp;<a href="%s" target="_blank" rel="noopener">open '
@@ -1103,16 +1155,17 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     brand = brand_of(job)
                     lowest = {r.zoddle_barcode: (r.lowest_price,
-                                                 lowest_source_name(r, brand))
+                                                 lowest_source_name(r, brand),
+                                                 lowest_link(r))
                               for r in job["rows"]}
-                    stem = re.sub(r"\.(csv|xlsx|xlsm)$", "", job["filename"],
-                                  flags=re.I) + "_live_prices"
+                    stem = download_name(job)
                     if m.group(2) == "/xlsx" and job.get("table"):
                         name = stem + ".xlsx"
                         ctype = ("application/vnd.openxmlformats-"
                                  "officedocument.spreadsheetml.sheet")
                         body = linkfile.priced_xlsx(
-                            job["table"], price_map(job["rows"]), lowest)
+                            job["table"], price_map(job["rows"]), lowest,
+                            links=link_map(job["rows"]))
                     else:
                         name, ctype = stem + ".csv", "text/csv; charset=utf-8"
                         body = (linkfile.priced_csv(job["table"],
@@ -1132,7 +1185,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/system-fix/state":
                 self._send(200, json.dumps(
-                    {"open": len(weekly.load_status()["issues"])}),
+                    {"open": len(daily.load_status()["issues"]),
+                     "html": system_fix_button()}),
                     "application/json")
                 return
             if path == "/template.csv":

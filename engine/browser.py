@@ -133,7 +133,7 @@ SHOWN_JS = r"""
   };
   // Amounts the page labels as the MRP ("MRP Rs 1,279", "M.R.P.: Rs 999",
   // "MRP (incl. of all taxes) Rs 999") -- never a saving ("Discount on
-  // MRP -Rs 1,655", "Rs 300 off MRP"). For the weekly MRP spot-check.
+  // MRP -Rs 1,655", "Rs 300 off MRP"). For the daily MRP spot-check.
   const MRP_WORD = /\bM\.?\s?R\.?\s?P\b\.?\s*(?:\([^)]{0,30}\))?\s*:?\s*$/i;
   const labelledMrp = text => {
     const got = [];
@@ -151,6 +151,9 @@ SHOWN_JS = r"""
   const struckIn = root => {
     const got = [];
     for (const el of root.querySelectorAll("*")) {
+      // A hidden element's innerText is its whole text: Bhama's Shopify
+      // theme keeps a hidden struck copy of the SALE price (30 Sep 2026).
+      if (!shows(el)) continue;
       const st = getComputedStyle(el);
       if (["DEL", "S", "STRIKE"].includes(el.tagName) ||
           st.textDecorationLine.includes("line-through"))
@@ -227,7 +230,7 @@ SHOWN_JS = r"""
 
 
 # A marketplace's own price box, as a shopper sees it (28 Sep 2026). Used by
-# the spot-check and the weekly check, never by a run: the app reads these
+# the spot-check and the daily check, never by a run: the app reads these
 # sites from their page data; this is the second, independent look.
 # Each answers in SHOWN_JS's shape: {h1, sell: [...], struck: [...]}.
 MARKET_JS = {

@@ -1486,6 +1486,45 @@ def link_file(k):
          grid[1][3:7] == [3599, 1114, 1099, 399.05] and grid[2][-2] == 959,
          (grid[1], grid[2]))
 
+    # Each price in the Excel download opens the page it was read from, as
+    # on the app's page (Abhisekh, 30 Sep 2026); a "-" opens nothing.
+    AMZ_SIZE = "https://www.amazon.in/dp/B0X45"
+    ws = openpyxl.load_workbook(io.BytesIO(linkfile.priced_xlsx(tbl, {
+        ("4470134", "own site"): 1099.0, ("4470134", "myntra"): 399.05,
+        ("4470145", "own site"): 1099.0, ("4470145", "myntra"): "not fetched",
+        ("4470145", "amazon"): 959.0},
+        {"4470134": (399.05, "Myntra", "https://www.myntra.com/x/1"),
+         "4470145": (959.0, "Amazon", AMZ_SIZE)},
+        links={("4470134", "own site"): "https://vastramay.com/products/a",
+               ("4470134", "myntra"): "https://www.myntra.com/x/1",
+               ("4470145", "own site"): "https://vastramay.com/products/a",
+               ("4470145", "myntra"): "https://www.myntra.com/x/1",
+               ("4470145", "amazon"): AMZ_SIZE}))).active
+    head_x = [c.value for c in ws[1]]
+    at = {h: j for j, h in enumerate(head_x)}
+    def target(r, h):
+        c = ws[r][at[h]]
+        return c.hyperlink.target if c.hyperlink else None
+    k.ok("each price in the Excel download links to its page",
+         target(2, "Myntra") == "https://www.myntra.com/x/1"
+         and target(2, "Vastramay Website") == "https://vastramay.com/products/a"
+         and target(3, "Amazon") == AMZ_SIZE,
+         (target(2, "Myntra"), target(3, "Amazon")))
+    k.ok("and stays a number", ws[2][at["Myntra"]].value == 399.05)
+    k.ok("'not fetched' links to the page too; a '-' links nowhere",
+         target(3, "Myntra") == "https://www.myntra.com/x/1"
+         and target(2, "Amazon") is None and ws[2][at["Amazon"]].value == "-")
+    k.ok("the Lowest price links to the page that holds it",
+         target(3, "Lowest price") == AMZ_SIZE
+         and target(2, "Lowest source") is None)
+    k.ok("the CSV download is unchanged by the links",
+         list(csv.reader(io.StringIO(linkfile.priced_csv(tbl, {
+             ("4470134", "own site"): 1099.0, ("4470134", "myntra"): 399.05,
+             ("4470145", "own site"): 1099.0, ("4470145", "myntra"): "",
+             ("4470145", "amazon"): 959.0},
+             {"4470134": (399.05, "Myntra", "https://www.myntra.com/x/1"),
+              "4470145": (959.0, "Amazon", AMZ_SIZE)})))) == out)
+
 
 def brand_catalogue(k):
     """Uploads are saved one sheet per brand and merged by design code."""
@@ -1678,6 +1717,18 @@ def hardening(k):
         sendable = False
     k.ok("a download name with a dash or Hindi in it can be sent",
          sendable and "filename*=UTF-8''" in hdr, hdr)
+    import datetime as _dt
+    day = _dt.date(2026, 9, 30)
+    k.ok("the download is named brand_day-of-the-fetch",
+         serve.download_name({"filename": "Bhama -- all saved products",
+                              "brand": "Bhama", "rows": [],
+                              "fetched_on": day}) == "Bhama_30-09-2026",
+         serve.download_name({"filename": "x", "brand": "Bhama",
+                              "rows": [], "fetched_on": day}))
+    k.ok("an upload with no brand keeps its file's name",
+         serve.download_name({"filename": "list.xlsx", "brand": "",
+                              "rows": [], "fetched_on": day})
+         == "list_30-09-2026")
     notice = serve.skipped_notice(issues)
     k.ok("rows that were not fetched are named on the page, with why",
          "row 3" in notice and "already on row 2" in notice, notice)
@@ -2483,6 +2534,13 @@ def js_sites(k):
               '<p><s>&#8377;1799</s><span>30% off</span></p></div>')
     bownbee = ('<div><h1>Krishna Kurta</h1><p>MRP &#8377; 1,279.00 &#8377; 799.00 '
                '38% off</p><p>Free delivery Above &#8377;999</p></div>')
+    # Bhama's Shopify theme: a hidden "regular price" copy of the sale
+    # price, struck by the theme's CSS (30 Sep 2026).
+    bhama = ('<style>.price-item--regular{text-decoration:line-through}</style>'
+             '<div><h1>Yellow Choli Lehenga</h1><div class="price">'
+             '<span>Rs. 1,300.00</span><div style="display:none">'
+             '<span class="price-item--regular">Rs. 1,300.00</span></div>'
+             '<s>Rs. 4,199.00</s><div>(69% Off)</div></div></div>')
     no_h1 = ('<title>Boys Anime Tee and Joggers | Shop</title><div><div style='
              '"font-size:22px">Boys Anime Tee and Joggers</div><h3>&#8377;749</h3>'
              '</div><div><p style="font-size:12px">Boys</p></div>')
@@ -2495,7 +2553,8 @@ def js_sites(k):
             for name, html_ in (("tss", tss), ("ranged", ranged),
                                 ("rail", rail), ("dollars", dollars),
                                 ("fab", fab), ("shelf", shelf), ("no_h1", no_h1),
-                                ("offers", offers), ("bownbee", bownbee)):
+                                ("offers", offers), ("bownbee", bownbee),
+                                ("bhama", bhama)):
                 head, _, body = html_.rpartition("</title>")
                 pg.set_content("<html><head>%s</head><body>%s</body></html>"
                                % (head + "</title>" if head else "", body))
@@ -2529,84 +2588,87 @@ def js_sites(k):
          got["bownbee"].get("mrp") == [1279] and got["fab"].get("mrp") == [2199]
          and got["tss"].get("mrp") == [699] and got["offers"].get("mrp") == [1799],
          [got[n].get("mrp") for n in ("bownbee", "fab", "tss", "offers")])
+    k.ok("page script: a hidden struck copy of the sale price is not the "
+         "MRP (bhamadesigns.com)", got["bhama"].get("mrp") == [4199]
+         and got["bhama"]["sell"] == [1300], got["bhama"])
     k.ok("page script: with no <h1>, the name the page's title gives is the "
          "heading (nusyl.com)", got["no_h1"]["sell"] == [749] and
          "Anime" in got["no_h1"]["h1"], got["no_h1"])
 
 
-def weekly_check(k):
-    """The weekly health check: a brand/channel is reported only when the
+def daily_check(k):
+    """The daily health check: a brand/channel is reported only when the
     app cannot read it (or reads it wrongly)."""
-    print("\nweekly check -- is every brand and channel readable?")
-    import weekly
+    print("\ndaily check -- is every brand and channel readable?")
+    import daily
 
     def L(ok, note="", price=999.0):
         return sites._listing("https://x.example/p", "x.example", "storefront",
                               ok=ok, note=note,
                               variants=[sites.Variant(frozenset(), price, None,
                                                       None, None)] if ok else [])
-    k.ok("weekly: a page with a price reads; sold out still reads",
-         weekly.judge(L(True))[0] == "reads")
-    k.ok("weekly: a product gone or a size not sold is an answer, not a failure",
-         weekly.judge(L(False, "delisted by the retailer (HTTP 410)"))[0] == "answer"
-         and weekly.judge(L(False, "this page does not sell size 7-8Y"))[0] == "answer")
-    k.ok("weekly: 'not fetched', 'check page', not rupees, robots are failures",
-         all(weekly.judge(L(False, n))[0] == "fails" for n in (
+    k.ok("daily: a page with a price reads; sold out still reads",
+         daily.judge(L(True))[0] == "reads")
+    k.ok("daily: a product gone or a size not sold is an answer, not a failure",
+         daily.judge(L(False, "delisted by the retailer (HTTP 410)"))[0] == "answer"
+         and daily.judge(L(False, "this page does not sell size 7-8Y"))[0] == "answer")
+    k.ok("daily: 'not fetched', 'check page', not rupees, robots are failures",
+         all(daily.judge(L(False, n))[0] == "fails" for n in (
              "fetch failed (Timeout)", "Amazon asked us to slow down",
              "the page shows 2 prices (1274, 1529) -- no usable price",
              sites._CURRENCY_NOTE % "USD", "disallowed by robots.txt")))
     ok_row = ("https://a/1", "reads", "", ("MATCH", [999.0], [999.0]))
-    bad = weekly.group_issues("B", "own site", [
+    bad = daily.group_issues("B", "own site", [
         ok_row, ("https://a/2", "fails", "not fetched: fetch failed (Timeout)", None)])
-    diff = weekly.group_issues("B", "own site", [
+    diff = daily.group_issues("B", "own site", [
         ("https://a/1", "reads", "", ("DIFFERENT", [2199.0], [1100.0]))])
-    dead = weekly.group_issues("B", "myntra", [
+    dead = daily.group_issues("B", "myntra", [
         ("https://m/1", "answer", "delisted by the retailer (HTTP 410)", None),
         ("https://m/2", "answer", "delisted by the retailer (HTTP 410)", None)])
-    fine = weekly.group_issues("B", "amazon", [
+    fine = daily.group_issues("B", "amazon", [
         ("https://z/1", "answer", "delisted", None),
         ("https://z/2", "reads", "", ("MATCH", [937.0], [937.0])),
         ("https://z/3", "reads", "", ("MATCH", [899.0], [899.0]))])
-    k.ok("weekly: a link the app cannot read is reported for its brand and channel",
+    k.ok("daily: a link the app cannot read is reported for its brand and channel",
          [(i[0], i[2]) for i in bad] == [("Not readable", "Website")], bad)
-    k.ok("weekly: a website read wrongly (not what shoppers see) is reported",
+    k.ok("daily: a website read wrongly (not what shoppers see) is reported",
          [i[0] for i in diff] == ["Read, but not what shoppers see"], diff)
-    k.ok("weekly: when every link tried is gone, it says there is nothing live "
+    k.ok("daily: when every link tried is gone, it says there is nothing live "
          "to test", [i[0] for i in dead] == ["No live product to test"], dead)
-    k.ok("weekly: a gone product among readable ones is NOT an issue",
+    k.ok("daily: a gone product among readable ones is NOT an issue",
          fine == [], fine)
-    unchecked = weekly.group_issues("B", "amazon", [
+    unchecked = daily.group_issues("B", "amazon", [
         ("https://z/1", "reads", "", ("CAN'T TELL", [937.0], [])),
         ("https://z/2", "reads", "", ("NOT CHECKED", [], [], "HTTP 503"))])
-    k.ok("weekly: a channel that reads but could not be spot-checked is reported",
+    k.ok("daily: a channel that reads but could not be spot-checked is reported",
          [i[0] for i in unchecked] == ["Spot-check could not be done"], unchecked)
 
     # -- System Fix (Abhisekh, 29 Sep 2026): a button, not a report page;
     #    a problem stays until a check on its brand and channel passes.
-    amz = weekly.as_issue(("Not readable", "B", "Amazon", "not fetched", "u1"),
+    amz = daily.as_issue(("Not readable", "B", "Amazon", "not fetched", "u1"),
                           "2026-10-05")
-    web = weekly.as_issue(("Not readable", "C", "Website", "not fetched", "u2"),
+    web = daily.as_issue(("Not readable", "C", "Website", "not fetched", "u2"),
                           "2026-10-05")
-    again = weekly.as_issue(("Not readable", "B", "Amazon", "not fetched", "u1"),
+    again = daily.as_issue(("Not readable", "B", "Amazon", "not fetched", "u1"),
                             "2026-10-12")
     k.ok("system fix: a full check that passes clears every problem",
-         weekly.merge_status([amz, web], [], None) == [])
+         daily.merge_status([amz, web], [], None) == [])
     k.ok("system fix: a recheck of B/Amazon that passes clears only that one",
-         weekly.merge_status([amz, web], [], {("B", "Amazon")}) == [web])
+         daily.merge_status([amz, web], [], {("B", "Amazon")}) == [web])
     k.ok("system fix: a problem found again keeps the day it was first found",
-         [i["found"] for i in weekly.merge_status([amz], [again], None)]
+         [i["found"] for i in daily.merge_status([amz], [again], None)]
          == ["2026-10-05"])
     import serve, tempfile
-    real = weekly.CHECKS
+    real = daily.CHECKS
     try:
-        weekly.CHECKS = pathlib.Path(tempfile.mkdtemp())
+        daily.CHECKS = pathlib.Path(tempfile.mkdtemp())
         none_page = serve.home()
-        weekly.save_status([], [amz], None, "1 brand", "full")
+        daily.save_status([], [amz], None, "1 brand", "full")
         one_page, details = serve.home(), serve.system_fix_page()
-        weekly.save_status(weekly.load_status()["issues"], [], None, "", "full")
+        daily.save_status(daily.load_status()["issues"], [], None, "", "full")
         cleared = serve.home()
     finally:
-        weekly.CHECKS = real
+        daily.CHECKS = real
     k.ok("system fix: no button while nothing is wrong",
          'class="sysfix"' not in none_page)
     k.ok("system fix: an open page asks for the button by itself (no reload)",
@@ -2617,27 +2679,36 @@ def weekly_check(k):
          and "Run the check again" in details and "u1" in details)
     k.ok("system fix: the button goes once a check passes", 'class="sysfix"'
          not in cleared)
+    # Abhisekh, 30 Sep 2026: a check that passed shows a tick, "Verified",
+    # with its time, until the next check.
+    k.ok("verified: no tick before any check has run",
+         'class="verified"' not in none_page)
+    k.ok("verified: no tick while a problem is open",
+         'class="verified"' not in one_page)
+    k.ok("verified: a passed check shows the tick with its time",
+         'class="verified"' in cleared and "Verified" in cleared
+         and "&#10004;" in cleared)
     # The re-check: the code's tests first, then EVERY brand and channel.
-    real_rt, real_pools = weekly.run_tests, weekly.pools
+    real_rt, real_pools = daily.run_tests, daily.pools
     asked = []
     try:
-        weekly.CHECKS = pathlib.Path(tempfile.mkdtemp())
-        weekly.save_status([], [amz], None, "", "full")
-        weekly.run_tests = lambda: ["a test -- its detail"]
-        weekly.pools = lambda brands=None: asked.append(brands) or {}
-        weekly.run(recheck=True, retry_after=0)
+        daily.CHECKS = pathlib.Path(tempfile.mkdtemp())
+        daily.save_status([], [amz], None, "", "full")
+        daily.run_tests = lambda: ["a test -- its detail"]
+        daily.pools = lambda brands=None: asked.append(brands) or {}
+        daily.run(recheck=True, retry_after=0)
         after_fail = [(i["brand"], i["kind"])
-                      for i in weekly.load_status()["issues"]]
+                      for i in daily.load_status()["issues"]]
         live_skipped = asked == []
-        weekly.run_tests = lambda: []
-        weekly.run(recheck=True, retry_after=0)
-        after_pass = weekly.load_status()["issues"]
+        daily.run_tests = lambda: []
+        daily.run(recheck=True, retry_after=0)
+        after_pass = daily.load_status()["issues"]
     finally:
-        weekly.CHECKS, weekly.run_tests, weekly.pools = real, real_rt, real_pools
+        daily.CHECKS, daily.run_tests, daily.pools = real, real_rt, real_pools
     k.ok("system fix: a re-check whose tests fail keeps the old problem, adds "
          "the failed tests, and does not run the live check",
          after_fail == [("B", "Not readable"),
-                        (weekly.TESTS_BRAND, "The code's own tests failed")]
+                        (daily.TESTS_BRAND, "The code's own tests failed")]
          and live_skipped, (after_fail, asked))
     k.ok("system fix: a re-check whose tests pass checks EVERY brand and "
          "channel (not only the listed ones) and clears what passed",
@@ -2763,7 +2834,7 @@ def main(argv=None):
     brand_catalogue(k)
     hardening(k)
     js_sites(k)
-    weekly_check(k)
+    daily_check(k)
 
     print("\n%d passed, %d failed" % (k.passed, k.failed))
     for name, detail in k.failures:

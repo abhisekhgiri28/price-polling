@@ -31,7 +31,7 @@ python -m playwright install chromium      # once; only needed for the headless 
 | --- | --- |
 | `requests` | Fetching product pages |
 | `openpyxl` | Reading `.xlsx` input files; the brand catalogue |
-| `playwright` | Optional. Used as a last resort for sites that show no price until a browser runs them, and by the spot-check and weekly check |
+| `playwright` | Optional. Used as a last resort for sites that show no price until a browser runs them, and by the spot-check and daily check |
 
 The web app itself uses only the standard library. Nothing in the engine
 calls an AI model.
@@ -46,7 +46,7 @@ python engine/compare.py <file.csv|.xlsx> [-o out.csv]   # no browser, CSV out
 python engine/validate.py                # 338 offline tests (~100 s)
 python engine/spotcheck.py               # the app's MRP vs the MRP a shopper sees
 python engine/spotcheck.py --recheck spotcheck_<date>.csv   # only the misses
-python engine/weekly.py                  # the weekly health check, by hand
+python engine/daily.py                  # the daily health check, by hand
 ```
 
 The app binds to `127.0.0.1` only. It accepts uploads and makes outbound
@@ -88,6 +88,12 @@ The columns are, in order:
 
 Wherever there is no price, the cell shows `-`. The Excel file keeps prices
 as numbers and centres the `-`.
+
+The file is named after the brand and the day of the live fetch, e.g.
+`Bhama_30-09-2026.xlsx`. In the Excel file every price (and "out of stock",
+"not fetched", and the Lowest price when one channel holds it) is a link to
+the page it was read from -- for Amazon and Flipkart, that size's own page.
+A CSV cannot hold links, so the CSV has plain prices.
 
 ## The input file
 
@@ -184,11 +190,11 @@ website links and the links in `spotcheck_links.csv` (optional).
 - **Verdicts:** MATCH, DIFFERENT, APP MISSED, CAN'T TELL, BOTH EMPTY.
 - **Output:** writes `spotcheck_<date>.csv`.
 
-### Weekly health check (`engine/weekly.py`)
+### Daily health check (`engine/daily.py`)
 
-This is meant to run every Monday at 11 am from Windows Task Scheduler. For
+This is meant to run every day at 11:15 am from Windows Task Scheduler. For
 every saved brand and every channel it links, it takes 2 random links (a
-different pair each week):
+different pair each day):
 
 - **Each link must read.** A product that is gone counts as an answer, and
   another link is tried in its place.
@@ -203,11 +209,13 @@ shows a flashing **System Fix !** button (a page already open shows it
 within 30 seconds, without a reload). Clicking it opens the details
 (`/system-fix`): each problem, its brand and channel, a link to the page and
 the day it was found. The button stays until a later check on that brand and
-channel passes: the next Monday's check, or **Run the check again** on the
-details page (`python engine/weekly.py --recheck`). The re-check uses the
+channel passes: the next day's check, or **Run the check again** on the
+details page (`python engine/daily.py --recheck`). The re-check uses the
 code as it is now: it runs the offline tests first (a failed test is itself
 a problem), then checks **every** brand and channel, so a new problem caused
-by a code change shows on the button too. The open problems are kept in `checks/status.json`. The check keeps
+by a code change shows on the button too. The open problems are kept in `checks/status.json`. When nothing is open and a check
+has passed, the same corner shows a green **✓ Verified** tick with the time
+of that check; it stays until the next check. The check keeps
 its results in `checks/` and never writes to the catalogue.
 
 ## Files
@@ -222,6 +230,6 @@ its results in `checks/` and never writes to the catalogue.
 | `engine/audit.py` | Hard checks on a run's numbers before they are trusted |
 | `engine/browser.py` | The headless-browser reader (last resort), plus the page scripts the checks use |
 | `engine/spotcheck.py` | The MRP spot-check |
-| `engine/weekly.py` | The weekly health check |
+| `engine/daily.py` | The daily health check |
 | `engine/validate.py` | 338 offline tests |
 | `data/brand_catalogue.xlsx` | The saved brands (one sheet per brand): barcodes, Zoddle prices, MRPs, each marketplace's link |
