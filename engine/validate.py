@@ -2595,6 +2595,103 @@ def js_sites(k):
          "heading (nusyl.com)", got["no_h1"]["sell"] == [749] and
          "Anime" in got["no_h1"]["h1"], got["no_h1"])
 
+    # -- Choosing each size on a price-range page, as a shopper does
+    #    (Abhisekh, 30 Sep 2026: hopscotch.in shows a range until a size
+    #    is chosen). Three kinds of size list; pages set from strings.
+    PRICE_BY = ("<script>function pick(t){document.getElementById('p').textContent="
+                "{'2-3 years':'\u20b91,274','3-4 years':'\u20b91,529'}[t]||'';"
+                "document.getElementById('m').textContent="
+                "{'2-3 years':'\u20b92,549','3-4 years':'\u20b92,899'}[t]||''}</script>")
+    head_ = ('<div><h1>Bow Dress</h1><span id="p">\u20b91,274 - \u20b91,529</span>'
+             '<div><span>MRP:</span><span id="m"></span><span>40% off</span></div>')
+    select_page = head_ + (
+        '<select onchange="pick(this.options[this.selectedIndex].text)">'
+        '<option>Choose an option</option><option>2-3 years</option>'
+        '<option>3-4 years</option><option disabled>5-6 years</option>'
+        '</select></div>') + PRICE_BY
+    button_page = head_ + (
+        '<ul><li><button onclick="pick(\'2-3 years\')">2-3 years</button></li>'
+        '<li><button onclick="pick(\'3-4 years\')">3-4 years</button></li>'
+        '<li class="sold-out"><button disabled>5-6 years</button></li></ul>'
+        '</div>') + PRICE_BY
+    opener_page = head_ + (
+        '<div id="box" onclick="document.getElementById(\'list\').style.display='
+        '\'block\'"><span id="chosen">Select a size</span></div>'
+        '<div id="list" style="display:none">'
+        '<div onclick="pick(\'2-3 years\');document.getElementById(\'chosen\')'
+        '.textContent=\'2-3 years\';this.parentElement.style.display=\'none\'">'
+        '<span>2-3 years</span></div>'
+        '<div onclick="pick(\'3-4 years\');document.getElementById(\'chosen\')'
+        '.textContent=\'3-4 years\';this.parentElement.style.display=\'none\'">'
+        '<span>3-4 years</span></div>'
+        '<div><span>5-6 years</span><span>Sold out</span></div></div>'
+        '</div>') + PRICE_BY
+    sized = {}
+    try:
+        real_wait = browser.PICK_WAIT_MS
+        browser.PICK_WAIT_MS = 150
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True)
+            pg = b.new_page()
+            for name, html_ in (("select", select_page), ("buttons", button_page),
+                                ("opener", opener_page)):
+                pg.set_content("<html><body>%s</body></html>" % html_)
+                sized[name] = browser.per_size(pg)
+            pg.set_content("<html><body><div><h1>Coat</h1><div><span>\u20b91,529"
+                           "</span><span>MRP:</span><span>\u20b92,549</span><span>"
+                           "40% off</span></div></div></body></html>")
+            joined = pg.evaluate(browser.SHOWN_JS)
+            b.close()
+    except Exception as e:
+        k.ok("the size picker runs in the browser", False, repr(e)[:200])
+        return
+    finally:
+        browser.PICK_WAIT_MS = real_wait
+    want = {"2-3 years": {"sell": [1274.0], "mrp": [2549.0]},
+            "3-4 years": {"sell": [1529.0], "mrp": [2899.0]}}
+    k.ok("size picker: a <select> of sizes -- each size chosen, its price "
+         "and MRP read, the disabled one left alone",
+         sized["select"] == want, sized["select"])
+    k.ok("size picker: size buttons beside the price; a sold-out one not "
+         "pressed", sized["buttons"] == want, sized["buttons"])
+    k.ok("size picker: a 'Select a size' box opened again for each size, "
+         "'Sold out' left alone (hopscotch.in)", sized["opener"] == want,
+         sized["opener"])
+    k.ok("page script: 'MRP:Rs 2,549' run into '40% off' is 2549, not 254940 "
+         "(hopscotch.in)", joined.get("mrp") == [2549] and
+         joined.get("sell") == [1529], joined)
+
+    import spotcheck
+    V = sites.Variant
+    app = sites._listing("https://x.example/p", "x.example", "storefront", ok=True,
+                         variants=[V(frozenset({"2-3Y"}), 1274.0, 2549.0, True, None),
+                                   V(frozenset({"3-4Y"}), 1529.0, 2899.0, True, None)])
+    page_ok = {"sell": [1274, 1529], "per_size": want}
+    page_bad = {"sell": [1274, 1529], "per_size": dict(want, **{
+        "3-4 years": {"sell": [1529.0], "mrp": [3199.0]}})}
+    k.ok("spot-check: each chosen size's MRP against the app's MRP for THAT "
+         "size -- MATCH", spotcheck.verdict(app, page_ok)[0] == "MATCH",
+         spotcheck.verdict(app, page_ok))
+    k.ok("spot-check: one size's MRP differing is DIFFERENT, though the MRP is "
+         "one the app read for another size",
+         spotcheck.verdict(app, dict(page_bad, per_size={
+             "2-3 years": {"sell": [1274.0], "mrp": [2899.0]}}))[0] == "DIFFERENT"
+         and spotcheck.verdict(app, page_bad)[0] == "DIFFERENT")
+    # Bhama prints "Rs 1,530 (64% Off)" and no MRP (30 Sep 2026).
+    bh = sites._listing("https://x.example/b", "x.example", "storefront", ok=True,
+                        variants=[V(frozenset({"3-4Y"}), 1530.0, 4199.0, True, None),
+                                  V(frozenset({"9-10Y"}), 1530.0, 4499.0, True, None)])
+    k.ok("spot-check: 'Rs 1,530 (64% Off)' with no MRP printed fits the app's "
+         "MRP 4199 -- MATCH; 20% off does not -- DIFFERENT",
+         spotcheck.verdict(bh, {"sell": [1530], "mrp": [], "off": 64})[0] == "MATCH"
+         and spotcheck.verdict(bh, {"sell": [1530], "mrp": [], "off": 20})[0]
+         == "DIFFERENT")
+    k.ok("spot-check: a page showing its MRP is judged by the MRP, not the %",
+         spotcheck.verdict(bh, {"sell": [1530], "mrp": [4199], "off": 20})[0]
+         == "MATCH")
+    k.ok("spot-check: a range with no size list stays CAN'T TELL",
+         spotcheck.verdict(app, {"sell": [1274, 1529]})[0] == "CAN'T TELL")
+
 
 def daily_check(k):
     """The daily health check: a brand/channel is reported only when the
@@ -2822,6 +2919,344 @@ def daily_check(k):
          got["flipkart"]["struck"] == [2999], got["flipkart"])
 
 
+def progress_estimate(k):
+    """The progress bar and its time estimate (Abhisekh, 30 Sep 2026: it
+    went ahead and came back)."""
+    print("\nprogress -- the bar and the time left")
+    import compare, serve, time as _t
+    AMZ = "https://www.amazon.in/dp/B0A"
+    WEB = "https://shop.example/products/a"
+    recs = [{"design_code": "1", "size": s_, "color": "",
+             "links": [("amazon", AMZ), ("own site", WEB)]}
+            for s_ in ("2-3Y", "3-4Y", "4-5Y")]
+    k.ok("the size pages Amazon will need are counted before the run",
+         compare.expected_size_pages(recs, [AMZ, WEB]) == {"www.amazon.in": 2},
+         compare.expected_size_pages(recs, [AMZ, WEB]))
+    k.ok("a link already read (Refetch) adds no size pages",
+         compare.expected_size_pages(recs, [WEB]) == {})
+    plan = {"hosts": {
+        "www.amazon.in": {"left": 10, "done": 5, "secs": 20.0, "since": None},
+        "shop.example": {"left": 10, "done": 20, "secs": 20.0, "since": None}},
+        "expected": {"www.amazon.in": 3}}
+    k.ok("the slowest site decides the time left, then the size pages",
+         abs(compare.remaining_seconds(plan, now=0) - (40 + 12)) < 0.01,
+         compare.remaining_seconds(plan, now=0))
+    k.ok("no plan yet, no estimate", compare.remaining_seconds({}) is None)
+    job = {"started": _t.monotonic() - 60, "plan": plan, "eta": None,
+           "done": 50, "total": 100, "urls": 100, "shown_pct": 0}
+    first = serve.estimate(job)[1]
+    plan["hosts"]["www.amazon.in"]["secs"] = 200.0     # Amazon slowed down
+    second = serve.estimate(job)[1]
+    k.ok("a sudden change moves the estimate a third of the way, not all",
+         first < second < first + (412 - first) / 2, (first, second))
+    k.ok("the bar shows the share of pages read", serve.progress_pct(job) == 50)
+    job["total"] = 140                 # more size pages than forecast
+    k.ok("and never goes back when the count grows",
+         serve.progress_pct(job) == 50)
+
+
+def stress_30sep(k):
+    """The harsh test of 30 Sep 2026: each bug it found, for every brand."""
+    print("\nstress test of 30 Sep 2026 -- the input, the readers, the flow")
+    import linkfile, catalogue, compare, daily, serve, tempfile, json as _j
+    import pathlib as _pl, io as _io, time as _t, os as _os
+
+    # -- the input file
+    k.ok("a decimal comma is a decimal point: 1114,50 and 1.299,00",
+         linkfile._money("1114,50") == 1114.5 and
+         linkfile._money("1.299,00") == 1299.0 and
+         linkfile._money("1,299") == 1299.0 and
+         linkfile._money("1,00,000") == 100000.0)
+    k.ok("infinity and NaN are not prices",
+         linkfile._money("inf") is None and linkfile._money(float("nan")) is None
+         and sites._num("inf") is None and sites._num(True) is None)
+    ctl = ("zoddle_barcode,design_code,size,zoddle_price,image,design name,Myntra\r\n"
+           "4470134,447,3-4Y,1114,https://x/i.jpg,Frock\x08,"
+           "https://www.myntra.com/x/1/buy\r\n").encode()
+    recs, iss, _, _ = linkfile.parse_bytes(ctl, "a.csv")
+    k.ok("a control character pasted into a cell is dropped, not a crash",
+         len(recs) == 1 and recs[0]["name"] == "Frock", [i.detail for i in iss])
+    two = ("zoddle_barcode,design_code,size,zoddle_price,image,Myntra,Myntra 2\r\n"
+           "4470134,447,3-4Y,1114,https://x/i.jpg,https://www.myntra.com/x/1/buy "
+           "https://www.myntra.com/y/2/buy,https://www.myntra.com/z/3/buy\r\n").encode()
+    recs, iss, _, _ = linkfile.parse_bytes(two, "a.csv")
+    codes = {i.code for i in iss}
+    k.ok("two links in one cell: the first is read, with a warning; a second "
+         "column for one marketplace is not read",
+         recs and recs[0]["links"] == [("myntra", "https://www.myntra.com/x/1/buy")]
+         and {"two_links", "second_link_column"} <= codes, (recs, codes))
+    bad = ("zoddle_barcode,design_code,size,zoddle_price,image,Website\r\n"
+           "4470134,447,3-4Y,1114,https://x/i.jpg,https://[shop.example/p\r\n").encode()
+    recs, iss, _, _ = linkfile.parse_bytes(bad, "a.csv")
+    k.ok("a link with a stray bracket is skipped with a reason, not a crash",
+         len(recs) == 1 and any(i.code == "link_not_a_url" for i in iss))
+    old = b"\xd0\xcf\x11\xe0" + b"\x00" * 60
+    k.ok("an old .xls file is named as one, not shown as garbage",
+         linkfile.parse_bytes(old, "a.xls")[1][0].code == "old_excel")
+    u16 = ("zoddle_barcode\tdesign_code\tsize\tzoddle_price\timage\tMyntra\r\n"
+           "4470134\t447\t3-4Y\t1114\thttps://x/i.jpg\thttps://www.myntra.com/x/1/buy\r\n"
+           ).encode("utf-16")
+    k.ok("Excel's 'Unicode Text' (UTF-16) save is read",
+         len(linkfile.parse_bytes(u16, "a.txt")[0]) == 1)
+    head = linkfile.layout([["Zoddle Barcode", "Design Code", "Size (Zoddle)",
+                             "Zoddle Price (Rs)", "Image 1", "Myntra"]])[2]
+    k.ok("headings with a unit, a number or the words turned round are read",
+         {"size", "zoddle_price", "image"} <= set(head), head)
+    k.ok("=HYPERLINK built from pieces is not taken for its first piece",
+         linkfile._hyperlink_formula('=HYPERLINK("https://www.myntra.com/"&G2,"M")')
+         is None and linkfile._hyperlink_formula('=HYPERLINK("https://x/p","M")')
+         == "https://x/p")
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["zoddle_barcode", "design_code", "size", "zoddle_price", "image",
+               "Myntra"])
+    ws.append(["4470134", "447", "3-4Y", "1114", "https://x/i.jpg",
+               "https://www.myntra.com/x/1/buy"])
+    ws["A2"].hyperlink = "https://zoddle.in/p/4470134"
+    buf = _io.BytesIO()
+    wb.save(buf)
+    recs, iss, _, _ = linkfile.parse_bytes(buf.getvalue(), "a.xlsx")
+    k.ok("a hyperlinked barcode cell keeps its barcode (a link counts only in "
+         "link and image columns)", len(recs) == 1, [i.detail for i in iss])
+    tbl = [["zoddle_barcode", "design_code", "size", "zoddle_price", "image",
+            "Remarks", "Myntra"],
+           ["4470134", "447", "3-4Y", "1114", "https://x/i.jpg", "== check ==",
+            "https://www.myntra.com/x/1/buy"]]
+    x = openpyxl.load_workbook(_io.BytesIO(linkfile.priced_xlsx(tbl, {}, {}))).active
+    k.ok("text starting with '=' is text in the Excel download, not a formula",
+         [c.data_type for c in x[2] if c.value == "== check =="] == ["s"])
+    long_a = catalogue.sheet_name("The Little Kids Company Clothing A")
+    long_b = catalogue.sheet_name("The Little Kids Company Clothing B")
+    k.ok("two long brand names alike in 31 letters get two sheets",
+         long_a != long_b and len(long_a) <= 31 and len(long_b) <= 31,
+         (long_a, long_b))
+    real = catalogue.PATH
+    try:
+        catalogue.PATH = _pl.Path(tempfile.mkdtemp()) / "c.xlsx"
+        r1 = linkfile.parse_bytes(ctl, "a.csv")[0]
+        catalogue.merge("sheet", r1)
+        k.ok("a brand called 'sheet' in a new catalogue keeps its name",
+             [b for b, _d, _n in catalogue.brands()] == ["sheet"])
+    finally:
+        catalogue.PATH = real
+
+    # -- the readers
+    real_req = sites.requests
+    try:
+        class Moved(FakeResponse):
+            pass
+        page = ('<script type="application/ld+json">{"@type":"Product","name":'
+                '"Other","offers":{"price":"1499","priceCurrency":"INR"}}</script>')
+        moved = Moved(200, None, page)
+        moved.url, moved.history = "https://w.example/products/replacement-kurta", [1]
+        home = Moved(200, None, page)
+        home.url, home.history = "https://w.example/", [1]
+        for name, resp in (("another product", moved), ("the home page", home)):
+            sites.requests = FakeRequests({"/products/old-kurta": resp})
+            sites._robots.clear()
+            got = sites.fetch_listing("https://w.example/products/old-kurta")
+            k.ok("a link the site sends on to %s is 'no price', never that "
+                 "page's price" % name, not got.ok and
+                 sites.empty_kind(got.note) == "no price", got.note)
+        same = Moved(200, None, page)
+        same.url, same.history = "https://www.amazon.in/Some-Title/dp/B0ABC12345", [1]
+        k.ok("a redirect that keeps the product's id is the same page",
+             not sites.redirected_away("https://www.amazon.in/dp/B0ABC12345", same))
+        three = "".join('<script type="application/ld+json">{"@type":"Product",'
+                        '"name":"%s","offers":{"price":"%s","priceCurrency":"INR"}}'
+                        '</script>' % (n, p_) for n, p_ in
+                        (("Other A", 499), ("Other B", 1299), ("Mine", 899)))
+        sites.requests = FakeRequests({"/p/x": FakeResponse(200, None, three)})
+        sites._robots.clear()
+        got = sites.ldjson_listing("https://w.example/p/x")
+        k.ok("several products with prices on one page: refused, not the first",
+             not got.ok and sites.empty_kind(got.note) == "check page", got.note)
+        titled = three + '<meta property="og:title" content="Mine">'
+        sites.requests = FakeRequests({"/p/x": FakeResponse(200, None, titled)})
+        got = sites.ldjson_listing("https://w.example/p/x")
+        k.ok("...unless the page's own title names one of them",
+             got.ok and got.variants[0].price == 899.0)
+        woo = ('<form class="variations_form" data-product_variations="[{&quot;'
+               'attributes&quot;:{&quot;attribute_pa_size&quot;:&quot;2-3y&quot;},'
+               '&quot;display_price&quot;:45,&quot;display_regular_price&quot;:45,'
+               '&quot;is_in_stock&quot;:true}]"></form>'
+               '<script type="application/ld+json">{"@type":"Product","name":"D",'
+               '"offers":{"price":"45","priceCurrency":"USD"}}</script>')
+        sites.requests = FakeRequests({"/product/d": FakeResponse(200, None, woo)})
+        got = sites.ldjson_listing("https://w.example/product/d")
+        k.ok("a size list priced in dollars is refused like any other price",
+             not got.ok and sites.empty_kind(got.note) == "not in rupees", got.note)
+        spec = ('<script type="application/ld+json">{"@type":"Product","name":"D",'
+                '"offers":{"priceSpecification":{"price":"87.00",'
+                '"priceCurrency":"USD"}}}</script>')
+        sites.requests = FakeRequests({"/p/s": FakeResponse(200, None, spec)})
+        got = sites.ldjson_listing("https://w.example/p/s")
+        k.ok("a currency inside priceSpecification counts",
+             not got.ok and sites.empty_kind(got.note) == "not in rupees", got.note)
+        agg = ('<script type="application/ld+json">{"@type":"Product","name":"D",'
+               '"offers":{"@type":"AggregateOffer","lowPrice":"499",'
+               '"highPrice":"899","priceCurrency":"INR"}}</script>'
+               '<meta property="product:price:amount" content="499">')
+        sites.requests = FakeRequests({"/p/a": FakeResponse(200, None, agg)})
+        got = sites.ldjson_listing("https://w.example/p/a")
+        k.ok("a price range with no size list is 'check page', not its low end",
+             not got.ok and sites.empty_kind(got.note) == "check page", got.note)
+        sites.requests = FakeRequests({"/products/n.json": FakeResponse(
+            200, {"product": None}), "/products/n": FakeResponse(200, None, page)})
+        got = sites.storefront_listing("https://w.example/products/n")
+        k.ok("a Shopify reply with no product falls back to the page",
+             got.ok and "adapter raised" not in got.note, got.note)
+    finally:
+        sites.requests = real_req
+        sites._robots.clear()
+
+    rules = sites._RobotRules("User-agent: *\nDisallow: /products/*.json\n"
+                              "Allow: /\nDisallow: /cart\nAllow: /cart/view$\n",
+                              sites.UA)
+    k.ok("robots.txt: '*' and '$' in rules, and the longest rule wins",
+         not rules.allows("https://w.example/products/x.json")
+         and rules.allows("https://w.example/products/x")
+         and not rules.allows("https://w.example/cart/add")
+         and rules.allows("https://w.example/cart/view"))
+    first = sites._RobotRules("User-agent: *\nAllow: /\nDisallow: /products/\n",
+                              sites.UA)
+    k.ok("robots.txt: 'Allow: /' above 'Disallow: /products/' still disallows",
+         not first.allows("https://w.example/products/x"))
+    try:
+        class Down:
+            def get(self, url, **kw):
+                return FakeResponse(503, None, "")
+        sites.requests = Down()
+        real_retries, sites.RETRIES = sites.RETRIES, 0
+        sites._robots.clear()
+        ok, why = sites.robots_allows("https://down.example/products/x")
+        k.ok("robots.txt that cannot be read (503) allows nothing for now, and "
+             "is asked again later", not ok and "could not be read" in why
+             and sites.empty_kind(why) == "not fetched", why)
+        class Missing:
+            def get(self, url, **kw):
+                return FakeResponse(404, None, "")
+        sites.requests = Missing()
+        sites._robots.clear()
+        k.ok("no robots.txt (404) allows everything",
+             sites.robots_allows("https://none.example/products/x")[0])
+    finally:
+        sites.requests, sites.RETRIES = real_req, real_retries
+        sites._robots.clear()
+
+    V = sites.Variant
+    nums = sites._listing("https://w.example/p", "w.example", "shopify", ok=True,
+                          per_size=True, variants=[
+                              V(frozenset({l}), 999.0, None, True, None)
+                              for l in ("22", "24", "26")])
+    k.ok("sizes named 22/24/26 are a size list: size 30 is 'no price'",
+         sites.empty_kind(sites.pick(nums, "30").note) == "no price",
+         sites.pick(nums, "30").note)
+    k.ok("labels: 'XL (14-15 Years)' is XL and 14-15Y; 'x-large' is XL; "
+         "'0-3 Mnths', '3-6 Mo' and 'Age 3-4' are sizes",
+         sites._labels_of("XL (14-15 Years)") == {"XL", "14-15Y"}
+         and sites._woo_label("x-large") == "XL"
+         and sites.norm_size("0-3 Mnths") == "0-3M"
+         and sites.norm_size("3-6 Mo") == "3-6M"
+         and sites.norm_size("Age 3-4") == "3-4")
+    two = sites._listing("https://w.example/p", "w.example", "storefront", ok=True,
+                         per_size=True, variants=[
+                             V(frozenset(), 499.0, None, True, None),
+                             V(frozenset(), 599.0, None, True, None)])
+    k.ok("two prices no size name tells apart are 'check page'",
+         sites.empty_kind(sites.pick(two, "3-4Y").note) == "check page")
+
+    # -- the flow
+    sites.begin_run()                     # the first run
+    sites._slow_down("www.amazon.in")     # ... is asked by Amazon to slow down
+    before = sites.pace_for("www.amazon.in")
+    sites.begin_run()                     # a second brand starts meanwhile
+    kept = sites.pace_for("www.amazon.in")
+    sites.end_run()
+    sites.end_run()
+    sites.new_run()
+    k.ok("a second run does not undo the first run's Amazon slow-down",
+         kept == before and sites.pace_for("www.amazon.in") < before,
+         (before, kept))
+    real_fetch = sites.fetch_listing
+    try:
+        def boom(url):
+            if url.endswith("/a"):
+                raise RuntimeError("x")
+            return sites._listing(url, "w.example", "storefront", ok=True,
+                                  variants=[V(frozenset(), 999.0, None, True, None)])
+        sites.fetch_listing = boom
+        got = {}
+        compare._fetch_all(["https://w.example/a", "https://w.example/b"],
+                           got, None, 0, 2)
+        k.ok("one page that raises does not stop the rest of its site",
+             got["https://w.example/b"].ok and not got["https://w.example/a"].ok)
+    finally:
+        sites.fetch_listing = real_fetch
+
+    real_checks = daily.CHECKS
+    try:
+        daily.CHECKS = _pl.Path(tempfile.mkdtemp())
+        for junk in ("[]", "null", '"x"', '{"issues": ["oops", {"kind": "K"}]}'):
+            daily.status_path().write_text(junk, encoding="utf-8")
+            st = daily.load_status()
+            ok = isinstance(st["issues"], list) and all(
+                isinstance(i, dict) for i in st["issues"])
+            try:
+                serve.system_fix_page()
+                serve.home()
+            except Exception:
+                ok = False
+            k.ok("a status file of the wrong shape (%s) does not take the app "
+                 "down" % junk[:12], ok)
+        daily.status_path().unlink()
+        daily.running_path().write_text(_j.dumps(
+            {"t": _t.time(), "at": "10:00", "pid": 999999999}), encoding="utf-8")
+        k.ok("a check that was killed leaves no 'running' mark behind",
+             daily.running_since() is None)
+        daily.running_path().write_text(_j.dumps(
+            {"t": _t.time(), "at": "10:00", "pid": _os.getpid()}), encoding="utf-8")
+        k.ok("a check that is running is seen as running",
+             daily.running_since() == "10:00")
+        k.ok("a second check does not start while one is running",
+             daily.run(retry_after=0) == (None, []))
+    finally:
+        daily.CHECKS = real_checks
+
+    job = serve.start_run("t", [], error="x")
+    job.update(state="done", records=[{"links": []}])
+    started = []
+    real_launch = serve.launch
+    try:
+        serve.launch = lambda j: started.append(j["id"])
+        import threading as _th
+        gate = _th.Barrier(2)
+
+        class H(serve.Handler):
+            def __init__(self):
+                self.path = "/job/%s/refetch" % job["id"]
+
+            def _job(self, jid):
+                return job
+
+            def _redirect(self, where):
+                pass
+
+        def press():
+            gate.wait()
+            H().do_POST()
+        ts = [_th.Thread(target=press) for _ in range(2)]
+        for t_ in ts:
+            t_.start()
+        for t_ in ts:
+            t_.join()
+        k.ok("two Refetch presses at once start ONE re-read", len(started) == 1,
+             started)
+    finally:
+        serve.launch = real_launch
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.parse_args(argv)
@@ -2835,6 +3270,8 @@ def main(argv=None):
     hardening(k)
     js_sites(k)
     daily_check(k)
+    progress_estimate(k)
+    stress_30sep(k)
 
     print("\n%d passed, %d failed" % (k.passed, k.failed))
     for name, detail in k.failures:

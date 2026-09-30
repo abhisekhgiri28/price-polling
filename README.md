@@ -164,7 +164,9 @@ size that wholly covers the row's size counts as that size (for example,
    has a link for, and an empty price always carries its reason.
 4. **MRP for comparing prices always comes from Zoddle.** A retailer's MRP
    is recorded for information only.
-5. **robots.txt is honoured per host.**
+5. **robots.txt is honoured per host,** read as Google reads it (`*`, `$`,
+   the longest rule wins). One that cannot be read allows nothing and is
+   asked again after 10 minutes.
 6. **One request per host per second** (Amazon: one every 3 s). A host that
    answers 429 has its pace doubled, up to 8 s.
 7. **Never ship a run whose audit fails.** `engine/audit.py` runs on every
@@ -185,8 +187,13 @@ website links and the links in `spotcheck_links.csv` (optional).
 - **What counts as the page's MRP:** a price that is struck through or
   labelled "MRP". If neither is shown, there is no discount, so the price
   shown is the MRP.
-- **Price ranges are not compared.** On such pages a size's MRP shows only
-  once a size is chosen, so the verdict is "can't tell".
+- **Price ranges: each size is chosen.** On such pages (Hopscotch) a
+  size's price and MRP show only once a size is chosen, so the spot-check
+  picks every size a shopper can buy -- from a drop-down, size buttons or a
+  "Select a size" list -- and compares each size's MRP with the app's for
+  that size. A range with no size list found stays "can't tell".
+- **A discount shown only as "(64% Off)"** with no MRP printed: the app's
+  MRP must give that discount on the price shown.
 - **Verdicts:** MATCH, DIFFERENT, APP MISSED, CAN'T TELL, BOTH EMPTY.
 - **Output:** writes `spotcheck_<date>.csv`.
 

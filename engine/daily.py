@@ -40,7 +40,7 @@ tests to pass. When all is well nothing is shown. Each day's results go
 to checks/<date>.json and one line to checks/log.txt. It never writes to
 the brand catalogue.
 """
-import sys, json, time, random, datetime, pathlib, collections, html
+import sys, os, json, time, random, datetime, pathlib, collections, html
 import argparse, traceback, urllib.parse
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -71,23 +71,69 @@ def running_path():
 
 def load_status():
     """{"checked": ..., "stats": ..., "issues": [dict, ...]} -- the open
-    problems the app's "System Fix !" button shows. Empty when none."""
+    problems the app's "System Fix !" button shows. Empty when none. A file
+    of the wrong shape ([], null, issues that are not records) reads as
+    empty: it took every page of the app down (30 Sep 2026)."""
     try:
         st = json.loads(status_path().read_text(encoding="utf-8"))
-        if isinstance(st.get("issues"), list):
-            return st
     except (OSError, ValueError):
-        pass
+        st = None
+    if isinstance(st, dict) and isinstance(st.get("issues"), list):
+        st = dict(st)
+        st["issues"] = [dict(i, brand=str(i.get("brand") or ""),
+                             channel=str(i.get("channel") or ""))
+                        for i in st["issues"] if isinstance(i, dict)]
+        return st
     return {"checked": None, "stats": "", "issues": []}
 
 
-def running_since():
-    """The time ("HH:MM") a check now running started, else None."""
+def _pid_alive(pid):
+    """Is process `pid` still running? (Windows: os.kill(pid, 0) would send
+    it Ctrl+C, so the process is asked about instead.)"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)     # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and \
+                code.value == 259                    # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _running_mark():
     try:
         st = json.loads(running_path().read_text(encoding="utf-8"))
-        if time.time() - float(st["t"]) < RUNNING_STALE_SECONDS:
+        return st if isinstance(st, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def running_since():
+    """The time ("HH:MM") a check now running started, else None. A mark
+    left by a check that was killed (the laptop shut, the task stopped)
+    is dead once its process is: it blocked "Run the check again" for four
+    hours (30 Sep 2026)."""
+    st = _running_mark()
+    try:
+        if st and time.time() - float(st["t"]) < RUNNING_STALE_SECONDS and \
+                ("pid" not in st or _pid_alive(st["pid"])):
             return st["at"]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (KeyError, TypeError, ValueError):
         pass
     return None
 
@@ -105,15 +151,16 @@ def merge_status(old, new, checked):
     problem is replaced by what it found), else the (brand, channel) pairs
     this check covered -- their old problems are replaced, the others stay
     open. A problem found again keeps the day it was first found."""
-    first = {(i["kind"], i["brand"], i["channel"], i["link"]): i.get("found")
-             for i in old}
+    key = lambda i: (i.get("kind"), i.get("brand"), i.get("channel"),
+                     i.get("link"))
+    first = {key(i): i.get("found") for i in old}
     kept = ([] if checked is None else
-            [i for i in old if (i["brand"], i["channel"]) not in checked])
+            [i for i in old if (i.get("brand", ""), i.get("channel", ""))
+             not in checked])
     out = []
     for i in new:
         i = dict(i)
-        i["found"] = first.get((i["kind"], i["brand"], i["channel"],
-                                i["link"])) or i.get("found")
+        i["found"] = first.get(key(i)) or i.get("found")
         out.append(i)
     return kept + out
 
@@ -202,14 +249,23 @@ def run(only=None, recheck=False, retry_after=RETRY_AFTER_SECONDS,
     """(status file or None, this check's issues). only: one brand (a
     trial); recheck: the code's tests, then every brand and channel."""
     CHECKS.mkdir(exist_ok=True)
+    if running_since():
+        # Another check is reading right now (the 11:15 task while a
+        # re-check runs): two at once doubled the Amazon traffic from one
+        # connection, and the first to finish removed the other's mark.
+        with open(CHECKS / "log.txt", "a", encoding="utf-8") as f:
+            f.write("%s  skipped: a check was already running\n"
+                    % datetime.date.today().isoformat())
+        return None, []
     now = datetime.datetime.now()
-    running_path().write_text(json.dumps(
-        {"t": time.time(), "at": now.strftime("%H:%M")}), encoding="utf-8")
+    mine = {"t": time.time(), "at": now.strftime("%H:%M"), "pid": os.getpid()}
+    running_path().write_text(json.dumps(mine), encoding="utf-8")
     try:
         return _run(only, recheck, retry_after, seed)
     finally:
         try:
-            running_path().unlink()
+            if (_running_mark() or {}).get("pid") == mine["pid"]:
+                running_path().unlink()      # only this check's own mark
         except OSError:
             pass
 

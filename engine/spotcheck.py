@@ -12,6 +12,11 @@ so the price it shows is its MRP). The two are compared:
   DIFFERENT    the page shows an MRP the app did not read -- look at it
   APP MISSED   the page shows an MRP, the app read no price
   CAN'T TELL   the page shows no single price beside its heading
+
+A page showing a price RANGE shows a size's MRP only once that size is
+chosen (hopscotch.in). There each size a shopper can buy is chosen in turn
+in the browser (browser.per_size), and each size's MRP is compared with the
+app's MRP for THAT size (Abhisekh, 30 Sep 2026).
   BOTH EMPTY   neither found a price (sold out, gone, not rupees ...)
 
 It is a check, not part of a run: nothing here changes a price. It makes
@@ -110,7 +115,7 @@ def shopper_view(url):
         return {"error": "the browser reader is not installed"}
     sites._wait_turn(host)
     return browser.render(url, sites.robots_allows, user_agent=sites.UA,
-                          js=browser.market_probe(url))
+                          js=browser.market_probe(url), sizes=True)
 
 
 def app_mrps(app):
@@ -119,14 +124,38 @@ def app_mrps(app):
     has no discount, so its MRP is its price. Pure."""
     if not app.ok:
         return []
-    out = set()
-    for v in app.variants:
-        if not v.price:
+    return sorted({_mrp_of(app, v) for v in app.variants if v.price})
+
+
+def _mrp_of(app, v):
+    return (v.compare_at if v.compare_at and v.compare_at > v.price else
+            app.listed_mrp if app.listed_mrp and app.listed_mrp > v.price
+            else v.price)
+
+
+def app_size_mrps(app):
+    """{label: {MRP, ...}} -- each label the app read (size or colour,
+    normalised) and the MRPs of the priced variants carrying it. Pure."""
+    out = collections.defaultdict(set)
+    if app.ok:
+        for v in app.variants:
+            if v.price:
+                for label in v.labels:
+                    out[sites.norm_size(label)].add(_mrp_of(app, v))
+    return dict(out)
+
+
+def page_size_mrps(shown):
+    """{size: {MRP, ...}} for each size chosen on the page (per_size): the
+    MRP shown once it was chosen, else -- no discount -- its one price. A
+    size whose price did not settle to one amount is left out. Pure."""
+    out = {}
+    for label, got in ((shown or {}).get("per_size") or {}).items():
+        sell = got.get("sell") or []
+        if len(sell) != 1:
             continue
-        out.add(v.compare_at if v.compare_at and v.compare_at > v.price else
-                app.listed_mrp if app.listed_mrp and app.listed_mrp > v.price
-                else v.price)
-    return sorted(out)
+        out[sites.norm_size(label)] = set(got.get("mrp") or []) or set(sell)
+    return out
 
 
 def page_mrps(shown):
@@ -142,14 +171,56 @@ def page_mrps(shown):
         # 999 once size 13 is chosen -- which the app reads). Not compared.
         return []
     mrp = [float(p) for p in (shown.get("mrp") or shown.get("struck") or []) if p]
+    if not mrp and shown_off(shown):
+        return []          # a discount with no MRP printed: see shown_off
     return sorted(set(mrp or sell))
+
+
+def shown_off(shown):
+    """(price, percent) when the page shows one price and a discount only
+    as "(64% Off)", printing no MRP (bhamadesigns.com: Rs 1,530 "(64% Off)"
+    -- its MRP, Rs 4,199, is not on the page). Else None. Pure."""
+    shown = shown or {}
+    sell = {float(p) for p in shown.get("sell") or [] if p}
+    off = shown.get("off")
+    if len(sell) != 1 or not off or not 0 < float(off) < 100 or \
+            shown.get("mrp") or shown.get("struck"):
+        return None
+    return sell.pop(), float(off)
+
+
+def off_fits(mrp, price, off):
+    """Whether `price` is `off` percent below `mrp`, as the page rounds it
+    (64% is anything from 63.5% to 64.5%). Pure."""
+    return mrp > price and abs(100.0 * (1 - price / mrp) - off) <= 0.6
 
 
 def verdict(app, shown):
     """(verdict, app MRPs, page MRPs) for one link. Abhisekh, 28 Sep 2026:
     the spot-check and the daily check compare the MRP, not the selling
     price. (A run still reports the selling price.)"""
+    sized = page_size_mrps(shown)
+    if sized:
+        # Size by size: the MRP the page shows once a size is chosen must
+        # be the one the app read for that size.
+        mine = app_size_mrps(app)
+        got = sorted({m for k in sized for m in mine.get(k, ())})
+        seen = sorted({m for ms in sized.values() for m in ms})
+        if not mine:
+            return "APP MISSED", got, seen
+        if all(any(_near(a, b) for a in mine.get(k, ()) for b in ms)
+               for k, ms in sized.items()):
+            return "MATCH", got, seen
+        return "DIFFERENT", got, seen
     got, seen = app_mrps(app), page_mrps(shown)
+    off = shown_off(shown)
+    if off and got:
+        # No MRP on the page, only "X% off": the app's MRP must give that
+        # discount on the price shown.
+        price, pc = off
+        seen = [round(price / (1 - pc / 100.0))]
+        return ("MATCH" if any(off_fits(g, price, pc) for g in got)
+                else "DIFFERENT"), got, seen
     if not got and not seen:
         return "BOTH EMPTY", got, seen
     if not got:

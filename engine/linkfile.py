@@ -24,7 +24,7 @@ encoding) -- so compare.run takes either. Each record carries `links`, the
 (channel, url) pairs from the named columns, which compare.channels_for uses
 in preference to guessing a channel from a URL's host.
 """
-import csv, io, re, collections, urllib.parse
+import csv, io, re, math, collections, urllib.parse
 
 # Same shape as intake.Issue, so the page renders both without caring.
 Issue = collections.namedtuple("Issue", "row_no barcode severity code detail")
@@ -76,7 +76,10 @@ def _fold(s):
 
 
 def _host(url):
-    return urllib.parse.urlsplit(url).netloc.lower()
+    try:
+        return urllib.parse.urlsplit(url).netloc.lower()
+    except ValueError:              # "https://[shop.com/p" -- a stray bracket
+        return ""
 
 
 def _on(host, hosts):
@@ -129,17 +132,30 @@ def _money(v):
     if v is None:
         return None
     if isinstance(v, (int, float)):
-        return float(v) if v > 0 else None
+        return float(v) if v > 0 and math.isfinite(v) else None
     # "1,299", "Rs. 1299", "₹1,299.00", "INR 1299" and "1299/-" are all
     # written in real files; each used to reject the row as having no price.
-    t = str(v).strip().replace(",", "").replace("₹", "")
+    t = str(v).strip().replace("₹", "")
     t = re.sub(r"^(?:rs\.?|inr)\s*", "", t, flags=re.I)
     t = re.sub(r"\s*/-$", "", t).strip()
+    # A decimal COMMA (a semicolon CSV from a decimal-comma locale):
+    # "1114,50" is 1114.50 and "1.299,00" is 1299.00 -- Indian grouping
+    # never ends in a 1-2 digit group, so these read as 111450 and 1.299.
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+,\d{1,2}", t):
+        t = t.replace(".", "").replace(",", ".")
+    elif re.fullmatch(r"\d+,\d{1,2}", t):
+        t = t.replace(",", ".")
+    t = t.replace(",", "")
     try:
         f = float(t)
     except ValueError:
         return None
-    return f if f > 0 else None
+    return f if f > 0 and math.isfinite(f) else None
+
+
+# Control characters Excel cannot store (a name pasted from the web with a
+# stray \x08): openpyxl refuses them, which failed the whole upload.
+_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def _text(v):
@@ -148,7 +164,14 @@ def _text(v):
         return ""
     if isinstance(v, float) and v.is_integer():
         return str(int(v))
-    return str(v).strip()
+    return _ILLEGAL.sub("", str(v)).strip()
+
+
+def safe_cell(cell):
+    """Text that starts with "=" is text, not a formula ("=Frock", "== check
+    ==" had Excel show #NAME? or repair the file)."""
+    if isinstance(cell.value, str) and cell.value.startswith("="):
+        cell.data_type = "s"
 
 
 def size_code(size):
@@ -158,8 +181,17 @@ def size_code(size):
 
 
 # ------------------------------------------------------------------ reading --
+class OldExcel(ValueError):
+    """An old .xls workbook: not readable here, and not CSV text either."""
+
+
 def _rows_from_csv(raw):
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+    if raw[:4] == b"\xd0\xcf\x11\xe0":
+        raise OldExcel("an old .xls workbook")
+    encs = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        encs = ("utf-16",)                  # Excel's "Unicode Text" save
+    for enc in encs:
         try:
             text = raw.decode(enc)
         except UnicodeDecodeError:
@@ -188,20 +220,32 @@ def _rows_from_xlsx(raw):
     # its value is only the label (or nothing, if never opened in Excel),
     # so the link used to be dropped -- silently, when there was no value.
     formulas = openpyxl.load_workbook(io.BytesIO(raw)).worksheets[0]
-    out = []
-    for row in ws.iter_rows():
+    out, hrefs = [], {}
+    for r, row in enumerate(ws.iter_rows()):
         vals = []
-        for c in row:
+        for j, c in enumerate(row):
             link = c.hyperlink.target if c.hyperlink is not None else None
             if not link:
                 link = _hyperlink_formula(formulas.cell(row=c.row,
                                                         column=c.column).value)
-            vals.append(link if link else _text(c.value))
+            if link:
+                hrefs[(r, j)] = link
+            vals.append(_text(c.value))
         out.append(vals)
+    # Only in a link or image column does a cell's hyperlink stand for it:
+    # a barcode or price cell linked to a product page kept the link and
+    # lost the barcode (the row was refused as "not numeric").
+    head_at, _header, col, links = layout(out)
+    use = {i for i, _, _ in links} | ({col["image"]} if "image" in col else set())
+    for (r, j), link in hrefs.items():
+        if r > head_at and j in use:
+            out[r][j] = link
     return out, "xlsx"
 
 
-_HYPERLINK = re.compile(r'^=\s*HYPERLINK\(\s*"([^"]+)"', re.I)
+# The address must be one whole quoted string: =HYPERLINK("https://x/"&G2,
+# "Myntra") builds it from pieces, and its first piece is a home page.
+_HYPERLINK = re.compile(r'^=\s*HYPERLINK\(\s*"([^"]+)"\s*[,)]', re.I)
 
 
 def _hyperlink_formula(value):
@@ -222,6 +266,11 @@ def parse_bytes(raw, filename=""):
             table, enc = _rows_from_xlsx(raw)
         else:
             table, enc = _rows_from_csv(raw)
+    except OldExcel:
+        return [], [Issue(0, None, "reject", "old_excel",
+                          "this is an old Excel (.xls) file -- open it in "
+                          "Excel and save it as .xlsx or .csv")], \
+            {"filename": filename}, None
     except Exception as ex:
         return [], [Issue(0, None, "reject", "unreadable",
                           "could not read the file (%s)" % type(ex).__name__)], \
@@ -247,10 +296,15 @@ def layout(table):
     header = [_text(c) for c in table[head_at]]
     folded = [_fold(h) for h in header]
 
+    # "Zoddle Price (Rs)", "Zoddle Price (INR)", "Image 1": a unit or a
+    # number after the name is still the name.
+    plain = [re.sub(r"(?:\s+(?:rs|inr))+$|\s+\d+$", "", h) for h in folded]
     col = {}
     for field, names in FIELDS.items():
         for i, h in enumerate(folded):
-            if h in names and i not in col.values():
+            # ... and "Size (Zoddle)" is "Zoddle size", in either order.
+            if (h in names or plain[i] in names or
+                    sorted(h.split()) in [sorted(n.split()) for n in names])                     and i not in col.values():
                 col[field] = i
                 break
     links = []                                   # (column index, channel, heading)
@@ -331,6 +385,7 @@ def priced_xlsx(table, prices, lowest=None, drop_headings=("last_updated",),
                    if isinstance(v, Kept) else v
                    for j, v in enumerate(r)])
         for j, c in enumerate(ws[ws.max_row]):
+            safe_cell(c)
             if c.value == NA:
                 c.alignment = centre
             elif (n, j) in hrefs:
@@ -377,6 +432,11 @@ def _priced(table, prices, lowest=None, drop_headings=("last_updated",),
     drop |= {i for i, h in enumerate(header)
              if _fold(h) in {_fold(d) for d in drop_headings}}
     link_ch = {i: ch for i, ch, _ in links}
+    first = {}
+    for i, ch, _ in links:
+        first.setdefault(ch, i)
+    extra_col = {i for i, ch in link_ch.items()
+                 if first[ch] != i and ch != "own site"}
     # A column no row fills (a saved brand's brand_size, say) is noise.
     body = [[_text(c) for c in r] for r in table[head_at + 1:]]
     drop |= {i for i in range(len(header)) if i not in link_ch
@@ -411,6 +471,8 @@ def _priced(table, prices, lowest=None, drop_headings=("last_updated",),
         repeat = n in refused
 
         def cell(i):
+            if i in extra_col:
+                return NA                      # a second column: not read
             if i in link_ch:
                 if cells[i].strip() and not is_link(cells[i]) and \
                         cells[i].strip() not in BLANK_LINKS:
@@ -465,6 +527,18 @@ def parse_table(table, filename=""):
                             "; ".join(why) + ". Columns found: "
                             + (", ".join(h for h in header if h) or "none")))
         return [], issues, meta
+
+    # One link column per marketplace (Abhisekh: one link per barcode per
+    # marketplace). A second "Myntra 2" column was fetched, then shown with
+    # the first column's price.
+    first_col = {}
+    for i, ch, heading in links:
+        if ch in first_col and ch != "own site":
+            issues.append(Issue(1, None, "warn", "second_link_column",
+                                "%s is a second %s column; only %s is read"
+                                % (heading, ch, first_col[ch][1])))
+        first_col.setdefault(ch, (i, heading))
+    read_cols = {i for i, _ in first_col.values()}
 
     seen = {}
     records = []
@@ -529,15 +603,25 @@ def parse_table(table, filename=""):
 
         row_links = []
         for i, ch, heading in links:
+            if i not in read_cols:
+                continue
             url = cells[i].strip() if i < len(cells) else ""
             if not url or url in BLANK_LINKS:
                 continue
+            if len(url.split()) > 1:
+                add("warn", "two_links", "%s: the cell holds more than one "
+                    "link; only the first is read" % heading)
+                url = url.split()[0]
             url = _with_scheme(url)
             if not url.lower().startswith(("http://", "https://")):
                 add("warn", "link_not_a_url",
                     "%s: %r is not a web link, so it was skipped" % (heading, url))
                 continue
             host = _host(url)
+            if not host:
+                add("warn", "link_not_a_url",
+                    "%s: %r is not a web link, so it was skipped" % (heading, url))
+                continue
             want = next((hs for name, _, hs in MARKETPLACES if name == ch), None)
             if want and not _on(host, want):
                 add("warn", "link_wrong_marketplace",

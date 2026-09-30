@@ -16,7 +16,7 @@ comes from a link in the file -- nothing is searched for.
 A row is produced for every barcode whether or not any price came back. A
 blank with a stated reason is a result; a missing row is not.
 """
-import collections, re, threading, urllib.parse
+import collections, re, threading, time, urllib.parse
 
 import sites, audit
 
@@ -272,7 +272,71 @@ def _resolve_channel(record, quotes):
     return quotes[0][0], quotes[0][1], ""
 
 
-def _fetch_all(urls, fetched, progress, step, total):
+# Sites that give every size its own page: a file's one link per design
+# means reading the other sizes' pages after it (see run).
+SIZE_PAGE_HOSTS = ("amazon.", "flipkart.")
+
+
+def _host(url):
+    return urllib.parse.urlsplit(url).netloc.lower()
+
+
+def expected_size_pages(records, urls):
+    """{host: pages}: how many more size pages the second pass of run will
+    probably read for these URLs -- each Amazon/Flipkart link is one size,
+    so every other size (and colour) the file asks of it is a page more.
+    Only a forecast, for the progress bar (Abhisekh, 30 Sep 2026: the bar
+    went ahead, then back, when these pages were found mid-run)."""
+    urls = set(urls)
+    asked = collections.defaultdict(set)
+    for rec in records:
+        for _, url in channels_for(rec):
+            if url in urls and any(h in _host(url) for h in SIZE_PAGE_HOSTS):
+                asked[url].add((sites.norm_size(rec.get("size")),
+                                sites.norm_size(rec.get("color"))))
+    out = collections.Counter()
+    for url, wants in asked.items():
+        out[_host(url)] += len(wants) - 1
+    return dict(out)
+
+
+def _plan_host(plan, host):
+    return plan.setdefault("hosts", {}).setdefault(
+        host, {"left": 0, "done": 0, "secs": 0.0, "since": None})
+
+
+def remaining_seconds(plan, now=None):
+    """Seconds a run still needs, from its `plan` (filled by run): each
+    site's pages left times that site's own time per page so far (its pace
+    until it has read one), the sites side by side -- so the slowest site
+    decides -- then the size pages still to come, again side by side.
+    None before the plan exists."""
+    hosts = (plan or {}).get("hosts")
+    if not hosts:
+        return None
+    now = time.monotonic() if now is None else now
+
+    def per_page(host, h):
+        if h["done"]:
+            return h["secs"] / h["done"]
+        return sites.pace_for(host) + 1.0
+
+    def left_time(host, h, pages):
+        t = pages * per_page(host, h)
+        if h["since"] is not None and pages:
+            # The page being read now has already taken part of its time.
+            t -= min(now - h["since"], per_page(host, h))
+        return max(0.0, t)
+
+    now_pass = max([left_time(k, h, h["left"]) for k, h in hosts.items()]
+                   or [0.0])
+    later = plan.get("expected") or {}
+    next_pass = max([later[k] * per_page(k, _plan_host(plan, k))
+                     for k in later] or [0.0])
+    return now_pass + next_pass
+
+
+def _fetch_all(urls, fetched, progress, step, total, plan=None):
     """Read every URL into `fetched`: one queue per site, the sites side by
     side. Each site's pages still go one at a time at that site's own pace
     (sites.py enforces it); what changes is that a slow site -- Amazon,
@@ -281,19 +345,35 @@ def _fetch_all(urls, fetched, progress, step, total):
     new step count."""
     queues = collections.OrderedDict()
     for url in urls:
-        queues.setdefault(urllib.parse.urlsplit(url).netloc.lower(), []).append(url)
+        queues.setdefault(_host(url), []).append(url)
     lock = threading.Lock()
     state = {"step": step}
+    plan = {} if plan is None else plan
+    with lock:
+        for host, todo in queues.items():
+            _plan_host(plan, host)["left"] += len(todo)
 
     def work(host, todo):
+        h = _plan_host(plan, host)
         for url in todo:
             with lock:
                 if progress:
                     progress(state["step"], total, host)
-            got = sites.fetch_listing(url)
+                h["since"] = time.monotonic()
+            try:
+                got = sites.fetch_listing(url)
+            except Exception as ex:
+                # One page's failure must not end this site's thread: its
+                # other pages went unread and the run failed with KeyError.
+                got = sites._listing(url, host, "", note="the page could not "
+                                     "be read (%s)" % type(ex).__name__)
             with lock:
                 fetched[url] = got
                 state["step"] += 1
+                h["secs"] += time.monotonic() - h["since"]
+                h["since"] = None
+                h["done"] += 1
+                h["left"] -= 1
 
     threads = [threading.Thread(target=work, args=item, daemon=True)
                for item in queues.items()]
@@ -304,11 +384,14 @@ def _fetch_all(urls, fetched, progress, step, total):
     return state["step"]
 
 
-def run(records, progress=None, fetched=None):
+def run(records, progress=None, fetched=None, plan=None):
     """Price every barcode against every channel the file names. One row each.
 
     `progress(done, total, label)` is called as each page is fetched, so a
     long file reports where it is instead of appearing to hang.
+
+    `plan`, a dict filled in place, is each site's pages left and time per
+    page, for remaining_seconds -- the page's time estimate.
 
     `fetched` is a dict of pages already read ({url: Listing}); it is filled
     in place. Given the dict from an earlier run, only the pages that failed
@@ -320,7 +403,14 @@ def run(records, progress=None, fetched=None):
     design is -- that is the parent project's job, and the absence is the
     point: every price here is traceable to a URL a person put in the file.
     """
-    sites.new_run()
+    sites.begin_run()
+    try:
+        return _run(records, progress, fetched, plan)
+    finally:
+        sites.end_run()
+
+
+def _run(records, progress, fetched, plan):
     urls = collections.OrderedDict()
     claimed = collections.defaultdict(set)
     for rec in records:
@@ -336,8 +426,12 @@ def run(records, progress=None, fetched=None):
     fetched = {} if fetched is None else fetched
     todo = [u for u in urls
             if u not in fetched or sites.retry_reason(fetched[u])]
-    total = len(todo)
-    step = _fetch_all(todo, fetched, progress, 0, total)
+    plan = {} if plan is None else plan
+    # The size pages of the second pass are counted from the start, so the
+    # bar does not reach the end and then fall back when they are found.
+    plan["expected"] = expected_size_pages(records, todo)
+    total = len(todo) + sum(plan["expected"].values())
+    step = _fetch_all(todo, fetched, progress, 0, total, plan)
 
     # Amazon and Flipkart give each size its own page. Where the file's link
     # is another size of the same listing, that listing's page for this
@@ -351,8 +445,9 @@ def run(records, progress=None, fetched=None):
             if sib and (sib not in fetched
                         or sites.retry_reason(fetched[sib])):
                 more[sib] = True
-    total += len(more)
-    step = _fetch_all(list(more), fetched, progress, step, total)
+    total = step + len(more)          # the forecast, replaced by the count
+    plan["expected"] = {}
+    step = _fetch_all(list(more), fetched, progress, step, total, plan)
 
     # Nothing else happens. A polling run is fetches and nothing more --
     # no catalogue walk, no ranking, no candidate to confirm. That is the

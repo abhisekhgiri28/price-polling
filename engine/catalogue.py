@@ -49,9 +49,15 @@ class CatalogueLocked(Exception):
 
 
 def sheet_name(brand):
-    """Excel sheet names: at most 31 characters, none of []:*?/\\."""
+    """Excel sheet names: at most 31 characters, none of []:*?/\\. A longer
+    name is cut and given a short mark of the whole name, so two brands
+    alike in their first 31 letters do not share one sheet."""
     name = re.sub(r"[\[\]:*?/\\]", " ", str(brand or "").strip())
-    name = re.sub(r"\s+", " ", name).strip()[:31]
+    name = re.sub(r"\s+", " ", name).strip()
+    if len(name) > 31:
+        import zlib
+        mark = "%04x" % (zlib.crc32(name.casefold().encode("utf-8")) & 0xffff)
+        name = name[:25].rstrip() + " ~" + mark
     return name or "Unbranded"
 
 
@@ -276,14 +282,16 @@ def merge(brand, records, path=None, today=None):
         columns = BASE + chans + extra + TAIL
         out_rows = sorted(by_barcode.values(), key=_row_key)
 
+        if not exists and wb.sheetnames == ["Sheet"]:
+            # A new workbook's own empty "Sheet": gone first, or a brand
+            # called "sheet" is saved as "sheet1".
+            del wb["Sheet"]
         if name in wb.sheetnames:
             idx = wb.sheetnames.index(name)
             del wb[name]
             ws = wb.create_sheet(name, idx)
         else:
             ws = wb.create_sheet(name)
-        if not exists and "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
-            del wb["Sheet"]
         _write_sheet(ws, columns, out_rows)
         _save(wb, path)
         stats["barcodes_total"] = len(out_rows)
@@ -310,6 +318,8 @@ def _write_sheet(ws, columns, rows):
         ws.append(values)
         for i, h in enumerate(columns, start=1):
             cell = ws.cell(row=ws.max_row, column=i)
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                cell.data_type = "s"         # text, never a formula
             if (h in link_cols or h not in BASE + TAIL) and \
                     isinstance(cell.value, str) and cell.value.startswith("http"):
                 cell.hyperlink = cell.value

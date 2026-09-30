@@ -242,7 +242,37 @@ def _retry_after(resp):
         return None
 
 
-def _get(url, host=None, tries=None, headers=None, session=None):
+def _strong_parts(path):
+    """The parts of a path that name one product: with a digit (an id, an
+    ASIN) or a hyphenated handle. "products", "p", "buy" name nothing."""
+    path = re.sub(r"\.(?:json|js|html?)$", "", (path or "").lower())
+    return [x for x in re.split(r"[/?&=]+", urllib.parse.unquote(path))
+            if x and (re.search(r"\d", x) or (len(x) >= 5 and re.search(r"[-+_]", x)))]
+
+
+def redirected_away(url, resp):
+    """Did the site answer `url` with a DIFFERENT page? A product taken down
+    is often sent on (301) to another product or to the home page, whose
+    price then read as this product's (found 30 Sep 2026). Same page: the
+    final address still carries the product's own id or handle."""
+    final = getattr(resp, "url", None)
+    if not isinstance(final, str) or not final:
+        return False
+    a, b = urllib.parse.urlsplit(url), urllib.parse.urlsplit(str(final))
+    if a.path.rstrip("/") == b.path.rstrip("/"):
+        return False
+    if not b.path.strip("/") and a.path.strip("/"):
+        return True                                  # sent to the home page
+    mine = _strong_parts(a.path)
+    there = urllib.parse.unquote(b.path.lower() + "?" + b.query.lower())
+    return bool(mine) and not any(x in there for x in mine)
+
+
+REDIRECTED_NOTE = "the site sent this link to another page (%s) -- the product has moved or is gone"
+
+
+def _get(url, host=None, tries=None, headers=None, session=None,
+         any_page=False):
     """One paced GET, retried while the answer means "ask again later".
 
     Returns (response, note). The response is handed back whenever the server
@@ -273,6 +303,8 @@ def _get(url, host=None, tries=None, headers=None, session=None):
         else:
             code = getattr(resp, "status_code", None)
             if code == 200:
+                if not any_page and redirected_away(url, resp):
+                    return None, REDIRECTED_NOTE % getattr(resp, "url", "")
                 return resp, ""
             if code in GONE_STATUS:
                 return resp, GONE_STATUS[code]
@@ -295,29 +327,88 @@ _robots = {}
 _robots_lock = threading.Lock()
 
 
+ROBOTS_RETRY_SECONDS = 600     # an unreadable robots.txt is asked again
+
+
+class _RobotRules:
+    """robots.txt read the way Google and the RFC (9309) read it: `*` and
+    `$` in paths, and the LONGEST matching rule wins (a tie goes to Allow).
+    Python's robotparser supports neither and lets the first line win, so
+    "Disallow: /products/*.json" allowed /products/x.json, and "Allow: /"
+    above "Disallow: /products/" allowed /products/x (30 Sep 2026)."""
+
+    def __init__(self, text, agent):
+        groups, cur, in_agents = [], None, False
+        for raw in (text or "").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if ":" not in line:
+                continue
+            k, v = (x.strip() for x in line.split(":", 1))
+            k = k.lower()
+            if k == "user-agent":
+                if cur is None or not in_agents:
+                    cur = {"agents": [], "rules": []}
+                    groups.append(cur)
+                cur["agents"].append(v.lower())
+                in_agents = True
+            elif k in ("allow", "disallow"):
+                in_agents = False
+                if cur is not None and v:
+                    cur["rules"].append((k == "allow", v))
+            else:
+                in_agents = False
+        me = agent.lower()
+        mine = [g for g in groups if any(a and a != "*" and a in me
+                                         for a in g["agents"])]
+        pick = mine or [g for g in groups if "*" in g["agents"]]
+        self.rules = [r for g in pick for r in g["rules"]]
+
+    @staticmethod
+    def _matches(pattern, path):
+        end = pattern.endswith("$")
+        rx = ".*".join(re.escape(x) for x in pattern.rstrip("$").split("*"))
+        return re.match(rx + ("$" if end else ""), path) is not None
+
+    def allows(self, url):
+        parts = urllib.parse.urlsplit(url)
+        path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        best = None
+        for allow, pattern in self.rules:
+            if self._matches(pattern, path):
+                size = len(pattern)
+                if best is None or size > best[0] or (size == best[0] and allow):
+                    best = (size, allow)
+        return True if best is None else best[1]
+
+
 def robots_allows(url):
-    """(allowed, reason). An unreadable robots.txt is reported, not assumed."""
+    """(allowed, reason). A missing robots.txt (4xx) allows everything; one
+    that cannot be read (5xx, no answer) allows NOTHING for now and is asked
+    again in ROBOTS_RETRY_SECONDS -- as Google treats it -- rather than
+    being taken as permission for the rest of the app's life."""
     host = urllib.parse.urlsplit(url).netloc
+    now = time.time()
     with _robots_lock:
         cached = _robots.get(host)
-    if cached is None:
-        rp, reason = None, ""
-        r, why = _get("https://%s/robots.txt" % host, host)
-        if r is not None and r.status_code == 200:
-            rp = urllib.robotparser.RobotFileParser()
-            rp.parse(r.text.splitlines())
+    if cached is None or (cached[2] is not None and now > cached[2]):
+        rules, reason, until = None, "", None
+        r, why = _get("https://%s/robots.txt" % host, host, any_page=True)
+        code = getattr(r, "status_code", None)
+        if code == 200:
+            rules = _RobotRules(r.text, UA)
+        elif code is not None and 400 <= code < 500:
+            rules = _RobotRules("", UA)             # no robots.txt: all allowed
         else:
-            # A rate-limited robots.txt is retried like anything else; only a
-            # settled failure lands here, and it is reported rather than
-            # quietly treated as permission.
-            reason = "robots.txt unavailable (%s)" % (why or "no response")
-        cached = (rp, reason)
+            reason = ("robots.txt could not be read (%s), so the page was not "
+                      "fetched" % (why or "no response"))
+            until = now + ROBOTS_RETRY_SECONDS
+        cached = (rules, reason, until)
         with _robots_lock:
             _robots[host] = cached
-    rp, reason = cached
-    if rp is None:
-        return True, reason        # surfaced in the note, not silently ignored
-    ok = rp.can_fetch(UA, url)
+    rules, reason, _until = cached
+    if rules is None:
+        return False, reason
+    ok = rules.allows(url)
     return ok, ("" if ok else "disallowed by robots.txt")
 
 
@@ -330,11 +421,13 @@ def norm_size(s):
     # Excel turns "3-4Y" into "3–4Y" as you type; every dash is a hyphen.
     s = re.sub("[\u2010-\u2015\u2212]", "-", s)
     for a, b in (("YEARS", "Y"), ("YEAR", "Y"), ("YRS", "Y"), ("YR", "Y"),
-                 ("MONTHS", "M"), ("MONTH", "M"), ("MTHS", "M"), ("MOS", "M")):
+                 ("MONTHS", "M"), ("MONTH", "M"), ("MNTHS", "M"), ("MNTH", "M"),
+                 ("MTHS", "M"), ("MOS", "M")):
         s = s.replace(a, b)
+    s = re.sub(r"(?<=\d)\s*MO$", "M", s)             # "3-6 Mo"
     s = re.sub(r"\s+", "", s)
     s = re.sub(r"[^0-9A-Z\-/+]", "", s)
-    s = re.sub(r"^SIZE(?=[0-9])", "", s)          # "Size 4" is 4 (suta.in)
+    s = re.sub(r"^(?:SIZE|AGE)(?=[0-9])", "", s)  # "Size 4" is 4 (suta.in)
     s = re.sub(r"(?<=\d)-(?=[YM]$)", "", s)       # "0-3-M" is 0-3M (kid1.co)
     # "2Y-3Y", "6M-12M" and "2TO3Y" are the same sizes as "2-3Y" and "6-12M".
     s = re.sub(r"^(\d+)TO(\d+)([YM])$", r"\1-\2\3", s)
@@ -364,7 +457,16 @@ def _labels_of(*parts):
             n = norm_size(piece)
             # "20 (2-3 Yrs)" is 2-3Y; the run-together "202-3Y" is noise.
             out |= inner or ({n} if n else set())
+            # "XL (14-15 Years)": the letter size outside the bracket is a
+            # size a row may name too.
+            outside = norm_size(re.sub(r"\([^()]*\)", "", piece))
+            if inner and outside in _LETTER_SIZES:
+                out.add(outside)
     return frozenset(out)
+
+
+_LETTER_SIZES = {"XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL", "2XL", "3XL",
+                 "4XL", "5XL", "FREESIZE"}
 
 
 def _months(label):
@@ -420,6 +522,8 @@ def _num(x):
     """A price, or None. Zero is not a price -- see the "0.00" trap."""
     if x is None:
         return None
+    if isinstance(x, bool):
+        return None                    # True is not a price of 1
     if isinstance(x, (int, float)):
         v = float(x)
     else:
@@ -430,7 +534,7 @@ def _num(x):
             v = float(t)
         except ValueError:
             return None
-    return v if v > 0 else None
+    return v if v > 0 and v == v and v != float("inf") else None
 
 
 # ------------------------------------------------------------------ shopify --
@@ -470,6 +574,10 @@ def shopify_listing(url):
     try:
         product = r.json()["product"]
     except Exception:
+        product = None
+    if not isinstance(product, dict) or not product:
+        # {"product": null} too: not a product, so the page's own data is
+        # read instead (it raised, and the fallback never ran).
         return _listing(url, site, "shopify", http_status=r.status_code,
                         note="response was not Shopify product JSON")
     cur = _foreign_currency(v.get("price_currency")
@@ -801,6 +909,16 @@ def _read_page(url, r, platform, site, note="", page_facts=None):
     renders it (`_in_browser`)."""
     extra = page_facts(r.text) if page_facts else {}
     products = [d for d in _ldjson_blobs(r.text) if _is_product(d)]
+    # Not in rupees, whichever reader would price it: the page's schema.org
+    # offers (price specifications too) and its price tag name the currency.
+    # WooCommerce's size list used to be read before this was looked at, so
+    # a $45 dress read as Rs 45 (30 Sep 2026).
+    cur = _foreign_currency(_page_currencies(products, r.text))
+    if cur:
+        return _listing(url, site, platform, http_status=r.status_code,
+                        product_name=(products[0].get("name") if products
+                                      else None),
+                        note=_CURRENCY_NOTE % cur, **extra)
     live = _live_variants(r.text, url) if platform in (
         "storefront", "hopscotch") else None
     if live:
@@ -828,6 +946,30 @@ def _read_page(url, r, platform, site, note="", page_facts=None):
                         per_size=True, image=shots[0] if shots else None,
                         images=shots, variants=woo,
                         note="per-size prices from the shop's own size list",
+                        **extra)
+    priced = [d for d in products
+              if _offer_price(d.get("offers") or {})[0] is not None]
+    if len({(str(d.get("name") or "").strip().lower(),
+             _offer_price(d.get("offers") or {})[0]) for d in priced}) > 1:
+        # Several products with prices (a related-products shelf, or the
+        # page a gone product was sent on to): only the one this page is
+        # about may be read -- named by its canonical address or its title.
+        own = _own_product(priced, r.text, url)
+        if own is None:
+            return _listing(url, site, platform, http_status=r.status_code,
+                            note="the page carries %d products and different "
+                                 "prices match this link" % len(priced),
+                            **extra)
+        products = [own]
+    span = _price_range(products)
+    if span:
+        # "Rs 499 - Rs 899" and no size list to say which size costs what:
+        # one price for every size would be a guess.
+        return _listing(url, site, platform, http_status=r.status_code,
+                        product_name=(products[0].get("name") if products
+                                      else None),
+                        note="the page gives a price range (%s - %s), so "
+                             "different prices match this link" % span,
                         **extra)
     for d in products:
         cur = _foreign_currency(
@@ -899,6 +1041,57 @@ def _read_page(url, r, platform, site, note="", page_facts=None):
 
 
 NO_PRODUCT_NOTE = "no schema.org Product offer with a price on the page"
+
+
+def _offers_of(d):
+    offers = d.get("offers") or []
+    return [o for o in (offers if isinstance(offers, list) else [offers])
+            if isinstance(o, dict)]
+
+
+def _page_currencies(products, text):
+    """Every currency the page states for its prices. Pure."""
+    out = [_og(text, "product:price:currency")]
+    for d in products:
+        for off in _offers_of(d):
+            out.append(off.get("priceCurrency"))
+            specs = off.get("priceSpecification")
+            for spec in (specs if isinstance(specs, list) else [specs]):
+                if isinstance(spec, dict):
+                    out.append(spec.get("priceCurrency"))
+    return out
+
+
+def _price_range(products):
+    """(low, high) when a schema.org offer states a price range and no
+    offer lists the sizes' own prices; else None. Pure."""
+    for d in products:
+        offers = _offers_of(d)
+        if len({_num(o.get("price")) for o in offers} - {None}) > 1:
+            return None                  # the offers price each size
+        for o in offers:
+            lo, hi = _num(o.get("lowPrice")), _num(o.get("highPrice"))
+            if lo and hi and hi > lo:
+                return ("%g" % lo, "%g" % hi)
+    return None
+
+
+def _own_product(priced, text, url):
+    """The one Product among several that the page itself is: its url is
+    the page's canonical address (or this link), or its name is the page's
+    og:title. None when that does not single one out. Pure."""
+    canon = _og(text, "og:url") or ""
+    m = re.search(r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"', text or "")
+    if m:
+        canon = canon or m.group(1)
+    here = {x.rstrip("/").lower() for x in (canon, url) if x}
+    title = (_og(text, "og:title") or "").strip().lower()
+    hits = [d for d in priced
+            if str(d.get("url") or "").rstrip("/").lower() in here]
+    if len(hits) != 1 and title:
+        hits = [d for d in priced
+                if str(d.get("name") or "").strip().lower() == title]
+    return hits[0] if len(hits) == 1 else None
 
 
 # ------------------------------------------------------------------ browser --
@@ -1462,7 +1655,9 @@ def _abfrl_variants(text, url):
 
 
 _WOO_WORDS = {"EXTRASMALL": "XS", "SMALL": "S", "MEDIUM": "M", "LARGE": "L",
-              "EXTRALARGE": "XL", "XXLARGE": "XXL", "FREE": "FREESIZE"}
+              "EXTRALARGE": "XL", "XXLARGE": "XXL", "FREE": "FREESIZE",
+              "XLARGE": "XL", "X-LARGE": "XL", "XSMALL": "XS", "X-SMALL": "XS",
+              "XX-LARGE": "XXL", "XXX-LARGE": "XXXL", "XXXLARGE": "XXXL"}
 
 
 def _woo_label(value):
@@ -1699,13 +1894,32 @@ AMZ_BLOCK_WAITS = (30.0, 90.0)   # seconds; a module constant so tests zero it
 _amz_gave_up = set()
 
 
+_active_runs = [0]
+
+
 def new_run():
     """Forget one run's slow-downs before the next. A 429 widens a host's
     pace "for the rest of the run" -- in the long-lived app that used to
-    mean until it was restarted."""
+    mean until it was restarted. Not while another run is reading: a
+    second brand's fetch, or a Refetch, wiped the first run's Amazon
+    slow-downs mid-run and sent it back into the check page (30 Sep 2026)."""
     with _pace_lock:
+        if _active_runs[0]:
+            return
         _host_pace.clear()
     _amz_gave_up.clear()
+
+
+def begin_run():
+    """A run starts reading (compare.run): new_run, then count it."""
+    new_run()
+    with _pace_lock:
+        _active_runs[0] += 1
+
+
+def end_run():
+    with _pace_lock:
+        _active_runs[0] = max(0, _active_runs[0] - 1)
 
 
 def amazon_listing(url):
@@ -2204,7 +2418,8 @@ _RETRYABLE = (("slow down", "Amazon asked us to slow down -- Refetch in about "
 _SOLD_OUT = ("not selling it right now", "not selling this size right now",
              "out of stock", "sold out", "notify me")
 _NOT_SOLD = ("does not sell size", "does not list size", "discontinued",
-             "delisted", "no such page", "no variant matches")
+             "delisted", "no such page", "no variant matches",
+             "sent this link to another page")
 
 
 def empty_kind(note):
@@ -2248,7 +2463,10 @@ def fetch_listing(url):
     """One network request. Never raises; failure comes back as ok=False."""
     if not url or not url.startswith(("http://", "https://")):
         return _listing(url, "", "", note="not an http url")
-    name, fn = platform_for(url)
+    try:
+        name, fn = platform_for(url)
+    except ValueError:                 # "https://[shop.com/..." -- no address
+        return _listing(url, "", "", note="not an http url")
     if fn is None:
         host = name.split(":", 1)[1]
         return _listing(url, host, name, note=UNSUPPORTED[host])
@@ -2303,7 +2521,11 @@ def sibling_for(lst, want=None, colour=None):
 
 _SIZE_LABEL = re.compile(r"^(?:\d+(?:\.\d+)?-\d+(?:\.\d+)?[YM]|\d+(?:\.\d+)?[YM]"
                          r"|XXS|XS|S|M|L|XL|XXL|XXXL|\d?XL|FREESIZE"
-                         r"|(?:EU|EUR|UK|US)\d+(?:\.\d)?)$")
+                         r"|(?:EU|EUR|UK|US)\d+(?:\.\d)?"
+                         # 30 Sep 2026: toddler 2T/3T, unit-less 1-2 / 2-3,
+                         # and numbered sizes 22/24/26 are size lists too --
+                         # a row asking another size is "no price" there.
+                         r"|\d{1,2}T|\d{1,2}-\d{1,2}|\d{2})$")
 
 
 def _is_size_label(label):
@@ -2432,6 +2654,11 @@ def pick(lst, want=None, colour=None, chooser=None):
         return bad("no usable price on the matching variants", matched)
     if len(prices) > 1:
         listed = ", ".join("%.0f" % p for p in sorted(prices))
+        if not any(_is_size_label(l) for v in picked for l in v.labels):
+            # Prices that no size name tells apart: two prices for one
+            # link, not a size the page does not sell.
+            return bad("%d different prices match this page and none of "
+                       "them names a size (%s)" % (len(prices), listed), matched)
         return bad(("no variant matches %s, and the variants carry %d "
                     "different prices (%s)"
                     % ("/".join(wanted), len(prices), listed))

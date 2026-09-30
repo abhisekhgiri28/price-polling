@@ -32,6 +32,7 @@ import linkfile, compare, sites, catalogue, daily
 MAX_UPLOAD = 32 * 1024 * 1024
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+KEEP_RUNS = 30
 
 
 # ---------------------------------------------------------------- multipart --
@@ -127,6 +128,12 @@ def start_run(label, records, issues=(), meta=None, error=None, table=None,
     }
     with JOBS_LOCK:
         JOBS[job_id] = job
+        # Runs live in memory: keep the newest KEEP_RUNS, so a day of
+        # fetching does not hold every page ever read (a running one stays).
+        done = [k for k, j in JOBS.items()
+                if j["state"] not in ("queued", "running")]
+        for k in done[:max(0, len(JOBS) - KEEP_RUNS)]:
+            del JOBS[k]
     if job["state"] == "rejected":
         if not job["error"]:
             first = next((i for i in job["issues"]
@@ -143,14 +150,16 @@ def launch(job):
     pages already read and fetches only those that failed for a passing
     reason -- the pop-up's Refetch."""
     job.update(state="running", done=0, total=0, where="",
-               started=time.monotonic(), finished=None, dismissed=False)
+               started=time.monotonic(), finished=None, dismissed=False,
+               plan={}, shown_pct=0, eta=None)
 
     def work():
         try:
             def progress(done, total, where):
                 job["done"], job["total"], job["where"] = done, total, where
             job["rows"], job["summary"] = compare.run(
-                job["records"], progress=progress, fetched=job["fetched"])
+                job["records"], progress=progress, fetched=job["fetched"],
+                plan=job["plan"])
             job["finished"] = time.monotonic()
             job["fetched_on"] = datetime.date.today()   # the download's name
             job["state"] = "done"
@@ -163,8 +172,12 @@ def launch(job):
 
 def start_saved(brand, design_text=""):
     """Re-poll a saved brand -- all of it, or the design codes typed in."""
-    wanted = [d for d in re.split(r"[\s,;]+", design_text or "") if d]
+    wanted = list(collections.OrderedDict.fromkeys(
+        d for d in re.split(r"[\s,;]+", design_text or "") if d))
     brand = catalogue.saved_name(brand)
+    if brand not in {b for b, _d, _n in catalogue.brands()}:
+        return start_run(brand, [], error="no brand called %s is saved -- "
+                         "upload its file first" % brand, brand=brand)
     records, issues, meta = catalogue.records_for(brand, wanted or None)
     label = "%s -- %s" % (catalogue.sheet_name(brand),
                           ("designs " + ", ".join(wanted)) if wanted
@@ -404,7 +417,7 @@ def duration(seconds):
     """A rough duration a person can read: "40 seconds", "6 min", "1 h 12 min"."""
     s = int(max(0, seconds))
     if s < 90:
-        return "%d seconds" % s
+        return "1 second" if s == 1 else "%d seconds" % s
     if s < 5400:
         return "%d min" % round(s / 60.0)
     return "%d h %d min" % (s // 3600, (s % 3600) // 60)
@@ -413,23 +426,35 @@ def duration(seconds):
 def estimate(job):
     """(elapsed, remaining_or_None) for a running job.
 
-    Extrapolates from the fraction completed rather than from a fixed
-    per-page cost. The old banner multiplied pages by one second and so
-    promised 30 seconds for a run that takes an hour -- the fetches are the
-    quick part, and the per-design ranking that follows them is not.
-
-    Returns None for the estimate until enough of the run has elapsed to
-    extrapolate from; a number invented in the first seconds is worse than
-    no number at all.
+    Site by site (compare.remaining_seconds): each site's pages left at
+    that site's own time per page, the slowest site deciding -- Amazon is
+    read at 3s a page while a brand's website takes about 1s, so a single
+    "X% in Y minutes" rate raced ahead and then fell back (Abhisekh, 30 Sep
+    2026). The number shown moves a third of the way toward each new
+    figure and otherwise counts down, so it does not jump about.
+    None in the first seconds, before any site has been timed.
     """
-    elapsed = time.monotonic() - job["started"]
-    done, total = float(job["done"] or 0), float(job["total"] or 0)
-    if total <= 0 or done <= 0 or elapsed < 5:
+    now = time.monotonic()
+    elapsed = now - job["started"]
+    raw = compare.remaining_seconds(job.get("plan"), now)
+    if raw is None or elapsed < 3:
         return elapsed, None
-    frac = min(1.0, done / total)
-    if frac <= 0.01:
-        return elapsed, None
-    return elapsed, max(0.0, elapsed * (1.0 - frac) / frac)
+    prev = job.get("eta")
+    if prev:
+        at, value = prev
+        guess = max(0.0, value - (now - at))
+        raw = guess + (raw - guess) / 3.0
+    job["eta"] = (now, raw)
+    return elapsed, max(0.0, raw)
+
+
+def progress_pct(job):
+    """The bar's percentage; it never goes back (the size pages' count
+    replaces a forecast mid-run and may be a few more)."""
+    total = job["total"] or job["urls"] or 1
+    pct = min(100, int(100 * job["done"] / total))
+    job["shown_pct"] = max(job.get("shown_pct") or 0, pct)
+    return job["shown_pct"]
 
 
 def page(title, h1, lede, body, script="", head=""):
@@ -788,8 +813,7 @@ def result_section(job, view="table"):
     title = '<h2 id="results">%s</h2>' % e(job["filename"])
 
     if job["state"] in ("queued", "running"):
-        total = job["total"] or job["urls"] or 1
-        pct = min(100, int(100 * job["done"] / total))
+        pct = progress_pct(job)
         _, remaining = estimate(job)
         html_ = title + """<div class="progress">
   <div class="pline"><b id="pct">%d%%</b><span id="eta">%s</span></div>
@@ -900,7 +924,8 @@ def download_name(job):
              "" if names else job.get("brand") or "")
     if not brand:
         brand = re.sub(r"\.(csv|xlsx|xlsm)$", "", job["filename"], flags=re.I)
-    brand = re.sub(r'[\\/:*?"<>|]+', " ", brand).strip() or "prices"
+    brand = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", brand)
+    brand = re.sub(r"\s+", " ", brand).strip(" .") or "prices"
     day = job.get("fetched_on") or datetime.date.today()
     return "%s_%s" % (brand, day.strftime("%d-%m-%Y"))
 
@@ -994,6 +1019,26 @@ def skipped_notice(issues):
 
 RECHECK_LOCK = threading.Lock()
 RECHECK_STARTED = [0.0]
+RECHECK_PROC = [None]          # the last re-check's process
+
+
+def recheck_log():
+    return daily.CHECKS / "recheck.log"
+
+
+def recheck_failed():
+    """The last line of what the last re-check printed, when it stopped
+    with an error (a change that broke the code: it died before it could
+    write a word, and the page only showed the old problems again)."""
+    proc = RECHECK_PROC[0]
+    if proc is None or proc.poll() in (None, 0):
+        return ""
+    try:
+        lines = recheck_log().read_text(encoding="utf-8",
+                                        errors="replace").strip().splitlines()
+    except OSError:
+        lines = []
+    return lines[-1] if lines else "exit code %s" % proc.returncode
 
 
 # A page left open shows (or drops) the button by itself: it asks every
@@ -1037,11 +1082,13 @@ def start_recheck():
                 or time.time() - RECHECK_STARTED[0] < 30):
             return False
         RECHECK_STARTED[0] = time.time()
-        subprocess.Popen(
-            [sys.executable, str(HERE / "daily.py"), "--recheck"],
-            cwd=str(HERE.parent), stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        daily.CHECKS.mkdir(exist_ok=True)
+        with open(recheck_log(), "w", encoding="utf-8") as log:
+            RECHECK_PROC[0] = subprocess.Popen(
+                [sys.executable, str(HERE / "daily.py"), "--recheck"],
+                cwd=str(HERE.parent), stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return True
 
 
@@ -1059,7 +1106,12 @@ def system_fix_page():
                   'refreshes by itself; the button goes away once the check '
                   'passes.</p>' % e(since))
     elif issues:
-        action = ('<form method="POST" action="/system-fix/recheck">'
+        broke = recheck_failed()
+        action = (('<p class="bad"><b>The last re-check stopped with an '
+                   'error</b> before it could check anything: %s -- see '
+                   'checks/recheck.log. Fix the code, then run it again.</p>'
+                   % e(broke)) if broke else "") + (
+                  '<form method="POST" action="/system-fix/recheck">'
                   '<button type="submit">Run the check again</button></form>'
                   '<p class="hint">Once it is fixed: this runs the code\'s '
                   'own tests, then checks EVERY brand and channel, so a new '
@@ -1138,11 +1190,10 @@ class Handler(BaseHTTPRequestHandler):
                 if m.group(2) == "/progress":
                     # The running page polls this instead of reloading, so
                     # the bar can travel to its new width rather than jump.
-                    total = job["total"] or job["urls"] or 1
                     elapsed, remaining = estimate(job)
                     self._send(200, json.dumps({
                         "state": job["state"],
-                        "pct": min(100, int(100 * job["done"] / total)),
+                        "pct": progress_pct(job),
                         "where": job["where"] or "",
                         "remaining": (duration(remaining)
                                       if remaining is not None else None),
@@ -1228,7 +1279,13 @@ class Handler(BaseHTTPRequestHandler):
                 job["dismissed"] = True
                 self._send(204, b"", "text/plain; charset=utf-8")
                 return
-            if job["state"] == "done" and job["records"]:
+            with JOBS_LOCK:
+                # Checked and claimed at once: a double click started two
+                # runs of one job, every page read twice (30 Sep 2026).
+                go = job["state"] == "done" and bool(job["records"])
+                if go:
+                    job["state"] = "running"
+            if go:
                 launch(job)
             self._redirect("/job/%s" % job["id"])
             return
@@ -1266,9 +1323,9 @@ class Handler(BaseHTTPRequestHandler):
             brand = next((d.decode("utf-8", "replace").strip()
                           for n, fn, d in fields if n == "brand" and not fn), "")
             if not parts:
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.end_headers()
+                self._send(200, home('<div class="banner warn"><b>No file '
+                                     'was chosen</b><p>Choose a .csv or .xlsx '
+                                     'file, then press upload.</p></div>'))
                 return
             jobs = [start_job(os.path.basename(fn.replace("\\", "/")), data,
                               brand)

@@ -46,7 +46,9 @@ _lock = threading.Lock()
 # shows a range or several prices, and nothing is chosen.
 SHOWN_JS = r"""
 () => {
-  const RUPEE = /(?:₹|\bRs\.?|\bINR)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/gi;
+  // Commas group 2-3 digits: "MRP:₹2,54940% off" (hopscotch.in, its spans
+  // run together) is Rs 2,549 then 40%, not Rs 254940.
+  const RUPEE = /(?:₹|\bRs\.?|\bINR)\s*((?:[0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]+)(?:\.[0-9]{1,2})?)/gi;
   const FOREIGN = /(?:US\$|\$|€|£|\bUSD|\bAED|\bEUR|\bGBP)\s*[0-9]/;
   // Words before an amount that make it something other than the price:
   // "You save", "Best price", "M.R.P.", "or Pay Rs 373 now" (pay-later,
@@ -211,6 +213,10 @@ SHOWN_JS = r"""
       out.struck = [...new Set(struck)];
       // The MRP a shopper is shown: struck through, or labelled "MRP".
       out.mrp = [...new Set([...struck, ...labelledMrp(text)])];
+      // A discount shown only as "(64% Off)", with no MRP printed
+      // (bhamadesigns.com, 30 Sep 2026).
+      const pc = text.match(/(\d{1,2}(?:\.\d+)?)\s*%\s*off\b/i);
+      out.off = pc ? parseFloat(pc[1]) : null;
       out.level = level;
       out.foreign = FOREIGN.test(text);
       // Stock, from the same block and the one around it (where the
@@ -354,12 +360,180 @@ def _settled(page, js=None):
         waited += SETTLE_MS
 
 
-def render(url, allows, user_agent=None, js=None):
+# -- Choosing each size, as a shopper does (Abhisekh, 30 Sep 2026) ---------
+# A page that shows a price RANGE ("Rs 1,274 - Rs 1,529", hopscotch.in)
+# shows a size's own price and MRP only once that size is chosen. For the
+# spot-check, each size a shopper can buy is chosen in turn and the page is
+# read again. Three kinds of size list are met: a <select> (WooCommerce),
+# size buttons beside the price, and a "Select a size" box that opens a
+# list (hopscotch.in). A size marked sold out cannot be chosen and is not.
+PER_SIZE_MAX = 12            # sizes chosen on one page, at most
+PICK_WAIT_MS = 900           # for the page to show the chosen size's price
+
+SIZE_OPTIONS_JS = r"""
+(anywhere) => {
+  const SIZE = /^(?:\d{1,2}(?:\.\d)?\s*-\s*\d{1,2}(?:\.\d)?\s*(?:y|yrs?|years?|m|mths?|months?)|\d{1,2}\s*(?:y|yrs?|years?|m|mths?|months?)|xxs|xs|s|m|l|xl|xxl|xxxl|[2-6]xl|free\s*size|(?:eu|uk|us)\s*\d{1,2}(?:\.\d)?|\d{2})$/i;
+  const SOLD = /sold\s*out|out\s*of\s*stock|unavailable|notify me/i;
+  const GONE = /out.?of.?stock|outstock|sold|disabled|unavailable|strike|oos\b|not-available|inactive/i;
+  const bare = t => t.replace(/\s*[-–(,]?\s*(?:sold\s*out|out\s*of\s*stock|unavailable)\)?\s*$/i, "").trim();
+  const shows = el => { const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 && st.visibility !== "hidden"; };
+  document.querySelectorAll("[data-zsize]").forEach(e => e.removeAttribute("data-zsize"));
+  // 1. A <select> listing the sizes.
+  const selects = [...document.querySelectorAll("select")];
+  for (let i = 0; i < selects.length; i++) {
+    const opts = [...selects[i].options].filter(o => SIZE.test(bare(o.text.trim())));
+    if (opts.length >= 2) {
+      selects[i].setAttribute("data-zsize", "select");
+      return {kind: "select", options: opts.map(o => ({label: bare(o.text.trim()),
+              value: o.value, gone: o.disabled || SOLD.test(o.text)}))};
+    }
+  }
+  // 2. Size buttons (or an opened list): short visible texts that are sizes,
+  // looked for in the blocks around the product's heading, widening out --
+  // or, once a list has been opened, anywhere on the page.
+  const h1 = [...document.querySelectorAll("h1")].find(shows);
+  const scopes = [];
+  if (anywhere || !h1) scopes.push(document.body);
+  else for (let e = h1, up = 0; e && up < 7; e = e.parentElement, up++) scopes.push(e);
+  for (const scope of scopes) {
+    const found = new Map();            // size -> the element to press
+    for (const el of scope.querySelectorAll("*")) {
+      if (el.children.length > 1 || !shows(el)) continue;
+      const t = bare((el.innerText || "").trim());
+      if (!t || t.length > 16 || !SIZE.test(t)) continue;
+      // The innermost element with the size's text is the one to press
+      // (the <button>, not the <li> around it).
+      const had = found.get(t);
+      if (had && !had.contains(el)) continue;
+      found.set(t, el);
+    }
+    // Sold out: the size's own wrappers say so -- walked up only while
+    // they hold this size alone ("5-6 years / Sold out"), never into the
+    // list that holds every size.
+    const gone = (el, t) => {
+      for (let e = el, i = 0; e && i < 4 && e !== scope &&
+           bare((e.innerText || "").trim()) === t; e = e.parentElement, i++) {
+        const cls = (e.className && e.className.toString()) || "";
+        if (GONE.test(cls) || e.disabled || e.getAttribute("aria-disabled") === "true" ||
+            getComputedStyle(e).textDecorationLine.includes("line-through") ||
+            SOLD.test(e.innerText || "") ||
+            [...e.querySelectorAll("input,button")].some(x => x.disabled))
+          return true;
+      }
+      return false;
+    };
+    if (found.size >= 2)
+      return {kind: "click", options: [...found].map(([label, el], i) => {
+        el.setAttribute("data-zsize", String(i));
+        return {label, value: String(i), gone: gone(el, label)};
+      })};
+    document.querySelectorAll("[data-zsize]").forEach(e => e.removeAttribute("data-zsize"));
+  }
+  return {kind: "none", options: []};
+}
+"""
+
+# The box that opens a size list: "Select a size", "Choose size" ...
+SIZE_OPENER_JS = r"""
+() => {
+  const OPEN = /^(?:please\s+)?(?:select|choose|pick)\s+(?:a\s+|your\s+)?size$/i;
+  for (const el of document.body.querySelectorAll("*")) {
+    if (el.children.length > 2) continue;
+    const r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) continue;
+    if (OPEN.test((el.innerText || "").trim())) {
+      document.querySelectorAll("[data-zopen]").forEach(e => e.removeAttribute("data-zopen"));
+      el.setAttribute("data-zopen", "1");
+      return true;
+    }
+  }
+  // Once a size is chosen the box shows that size instead: the box marked
+  // when it was first opened is still the one to open.
+  return !!document.querySelector("[data-zopen]");
+}
+"""
+
+
+def _open_list(page):
+    """Open a "Select a size" box; False when the page has none."""
+    if not page.evaluate(SIZE_OPENER_JS):
+        return False
+    page.click("[data-zopen]", timeout=3000)
+    page.wait_for_timeout(PICK_WAIT_MS)
+    return True
+
+
+def _size_options(page):
+    """(kind, options, opener) for the page's size list -- opening a
+    "Select a size" box first when the sizes are not on show."""
+    got = page.evaluate(SIZE_OPTIONS_JS, False)
+    if got["kind"] != "none":
+        return got["kind"], got["options"], False
+    if _open_list(page):
+        got = page.evaluate(SIZE_OPTIONS_JS, True)
+        if got["kind"] != "none":
+            return got["kind"], got["options"], True
+    return "none", [], False
+
+
+def _read_after_pick(page):
+    """SHOWN_JS once the chosen size's price has shown: two readings alike
+    with one price, or the last one after a few seconds."""
+    last = None
+    for _ in range(6):
+        page.wait_for_timeout(PICK_WAIT_MS if last is None else 500)
+        now = page.evaluate(SHOWN_JS)
+        if now == last and len(set(now.get("sell") or [])) == 1:
+            return now
+        last = now
+    return last or {}
+
+
+def per_size(page):
+    """{size label: {"sell": [...], "mrp": [...]}} for each size a shopper
+    can buy, each chosen in turn. {} when the page has no size list. Never
+    raises: a size that cannot be chosen is left out."""
+    try:
+        kind, options, opener = _size_options(page)
+    except Exception:
+        return {}
+    out = {}
+    for o in [o for o in options if not o["gone"]][:PER_SIZE_MAX]:
+        try:
+            if kind == "select":
+                page.select_option('select[data-zsize="select"]', value=o["value"])
+            else:
+                if opener:
+                    # The list closes once a size is chosen: open it again
+                    # and find this size in it afresh.
+                    fresh = page.evaluate(SIZE_OPTIONS_JS, True)
+                    if fresh["kind"] == "none" and _open_list(page):
+                        fresh = page.evaluate(SIZE_OPTIONS_JS, True)
+                    hit = next((f for f in fresh["options"]
+                                if f["label"] == o["label"]), None)
+                    if not hit:
+                        continue
+                    o = dict(o, value=hit["value"])
+                page.click('[data-zsize="%s"]' % o["value"], timeout=3000)
+            shown = _read_after_pick(page)
+            out[o["label"]] = {
+                "sell": sorted({float(x) for x in shown.get("sell") or [] if x}),
+                "mrp": sorted({float(x) for x in shown.get("mrp") or [] if x})}
+        except Exception:
+            continue
+    return out
+
+
+
+def render(url, allows, user_agent=None, js=None, sizes=False):
     """Load `url` in headless Chromium and read what it shows.
 
     Returns a dict: status, html (the rendered page), shown (SHOWN_JS's
     answer, or `js`'s -- a MARKET_JS script), blocked (requests robots.txt
     refused) -- or {"error": why}.
+    With `sizes`, a page showing a price range has each size chosen in turn
+    (per_size) and the answers added as shown["per_size"] -- the spot-check.
     Never raises.
     """
     if not available():
@@ -399,6 +573,9 @@ def render(url, allows, user_agent=None, js=None):
                     resp = page.goto(url, wait_until="commit",
                                      timeout=LOAD_TIMEOUT_MS)
                     shown = _settled(page, js)
+                    if sizes and not js and shown and \
+                            len(set(shown.get("sell") or [])) > 1:
+                        shown["per_size"] = per_size(page)
                     try:                  # requests still in flight: let go
                         page.unroute_all(behavior="ignoreErrors")
                     except Exception:
